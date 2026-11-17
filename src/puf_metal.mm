@@ -33,7 +33,6 @@ static std::mutex g_mu;
 static std::vector<Chunk> g_chunks;           // guarded by g_mu
 static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResources
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipes;
-static std::unordered_map<std::string, MPSMatrixMultiplication*> g_gemms;
 static NSMutableDictionary* g_macros = nil;
 static std::atomic<long> g_flushes{0}, g_gemm_n{0}, g_dispatch_n{0}, g_blit_n{0};
 
@@ -45,6 +44,9 @@ struct ThreadCtx {
     id<MTLCommandBuffer> cb = nil;
     id<MTLComputeCommandEncoder> compute = nil;
     id<MTLBlitCommandEncoder> blit = nil;
+    // MPS kernel objects are not safe to encode from several threads at once,
+    // so each thread caches its own (rollout workers encode concurrently).
+    std::unordered_map<std::string, MPSMatrixMultiplication*> gemms;
 };
 static thread_local ThreadCtx* tl_ctx = nullptr;
 
@@ -236,17 +238,14 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     char key[128];
     snprintf(key, sizeof(key), "%d%d %d %d %d %a %a", tb, ta, n, m, k, alpha, beta);
     MPSMatrixMultiplication* mm;
-    {
-        std::lock_guard<std::mutex> g(g_mu);
-        auto it = g_gemms.find(key);
-        if (it == g_gemms.end()) {
-            mm = [[MPSMatrixMultiplication alloc] initWithDevice:g_dev
-                transposeLeft:tb ? YES : NO transposeRight:ta ? YES : NO
-                resultRows:n resultColumns:m interiorColumns:k alpha:alpha beta:beta];
-            g_gemms[key] = mm;
-        } else {
-            mm = it->second;
-        }
+    auto it = c->gemms.find(key);
+    if (it == c->gemms.end()) {
+        mm = [[MPSMatrixMultiplication alloc] initWithDevice:g_dev
+            transposeLeft:tb ? YES : NO transposeRight:ta ? YES : NO
+            resultRows:n resultColumns:m interiorColumns:k alpha:alpha beta:beta];
+        c->gemms[key] = mm;
+    } else {
+        mm = it->second;
     }
     [mm encodeToCommandBuffer:c->cb leftMatrix:ml rightMatrix:mr resultMatrix:mc];
     g_gemm_n++;
