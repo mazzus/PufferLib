@@ -5,7 +5,7 @@
 // backends with tests/oracle_compare.py.
 //
 //   ./tests/oracle_train.sh            # builds build/oracle_train for this machine
-//   ./build/oracle_train out.bin [--section.key=value ...]
+//   ./build/oracle_train_ENV out.bin [--section.key=value ...]
 //
 // Precision: build both sides fp32 (CUDA: --float).
 #include "pufferl.cu"

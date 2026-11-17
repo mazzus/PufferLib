@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the backend parity oracle (tests/oracle_train.cu) for this machine:
 # macOS -> CPU backend (clang++), Linux -> CUDA (nvcc), both fp32.
-# Output: ./build/oracle_train. Run ./build.sh ENV --cpu (macOS) or ./build.sh ENV
+# Output: ./build/oracle_train_ENV. Run ./build.sh ENV --cpu (macOS) or ./build.sh ENV
 # (Linux) once first so raylib is downloaded.
 #   ./tests/oracle_train.sh [ENV]   (default breakout)
 set -e
@@ -25,15 +25,15 @@ if [ "$(uname -s)" = "Linux" ]; then
         tests/oracle_train.cu raylib-5.5_linux_amd64/lib/libraylib.a \
         -L$CUDA_HOME/lib64 $NCCL_L -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver \
         -lcurand -lm -Xlinker=-lpthread ${OMP_LIB:--lgomp} -lGL \
-        -o build/oracle_train
+        -o build/oracle_train_$ENV
 else
     OMP_PREFIX="$(brew --prefix libomp)"
     ${CXX:-clang++} -std=c++17 -O2 -g -w -Wno-narrowing "${COMMON[@]}" \
-        -DPUF_TRAIN_CPU -Iraylib-5.5_macos/include -DPLATFORM_DESKTOP \
+        -DPUF_TRAIN_CPU -fveclib=Darwin_libsystem_m -Iraylib-5.5_macos/include -DPLATFORM_DESKTOP \
         -Xclang -fopenmp -I"$OMP_PREFIX/include" \
         -x c++ tests/oracle_train.cu -x none raylib-5.5_macos/lib/libraylib.a \
         -L"$OMP_PREFIX/lib" -lomp -framework Accelerate -framework Cocoa \
         -framework IOKit -framework CoreVideo -framework OpenGL \
-        -o build/oracle_train
+        -o build/oracle_train_$ENV
 fi
-echo "Built: ./build/oracle_train"
+echo "Built: ./build/oracle_train_$ENV"

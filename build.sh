@@ -440,7 +440,7 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
         CPU_OPT=(-O2 -g)
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN (CPU trainer)..."
-    ${CXX:-clang++} -std=c++17 "${CPU_OPT[@]}" "${SIMD_FLAGS[@]}" \
+    ${CXX:-clang++} -std=c++17 "${CPU_OPT[@]}" "${SIMD_FLAGS[@]}" -fveclib=Darwin_libsystem_m \
         -Wno-narrowing -Wno-c99-designator -Wno-unreachable-code \
         -Wno-vla-cxx-extension -Wno-unused-function -Wno-unused-variable \
         -I. -Isrc -I$SRC_DIR -Ivendor "${INCLUDES[@]}" \

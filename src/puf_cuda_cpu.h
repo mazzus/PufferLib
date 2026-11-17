@@ -250,6 +250,71 @@ static inline cudaError_t cudaGraphLaunch(cudaGraphExec_t, cudaStream_t) {
 }
 static inline cudaError_t cudaGraphDestroy(cudaGraph_t) { return cudaSuccess; }
 
+// Optional profiler: PUF_CPU_PROFILE=1 prints per-kernel / per-GEMM-shape wall
+// time at exit (summed over all threads that launch).
+#include <atomic>
+#include <mutex>
+struct PufProfEntry { const char* name; char key[96]; double sec; long calls; };
+inline std::mutex puf_prof_mu;
+inline PufProfEntry puf_prof_tab[512];
+inline int puf_prof_n = 0;
+inline int puf_prof_on = -1;
+static inline void puf_prof_dump() {
+    std::lock_guard<std::mutex> g(puf_prof_mu);
+    double total = 0;
+    for (int i = 0; i < puf_prof_n; i++) total += puf_prof_tab[i].sec;
+    // simple selection sort by time
+    for (int i = 0; i < puf_prof_n; i++) {
+        for (int j = i + 1; j < puf_prof_n; j++) {
+            if (puf_prof_tab[j].sec > puf_prof_tab[i].sec) {
+                PufProfEntry t = puf_prof_tab[i];
+                puf_prof_tab[i] = puf_prof_tab[j];
+                puf_prof_tab[j] = t;
+            }
+        }
+    }
+    fprintf(stderr, "\nPUF_CPU_PROFILE (total %.2fs)\n", total);
+    for (int i = 0; i < puf_prof_n && i < 40; i++) {
+        PufProfEntry* e = &puf_prof_tab[i];
+        fprintf(stderr, "%8.3fs %5.1f%% %9ld  %s\n", e->sec, 100 * e->sec / total,
+            e->calls, e->key);
+    }
+}
+static inline bool puf_prof_enabled() {
+    if (puf_prof_on < 0) {
+        const char* v = getenv("PUF_CPU_PROFILE");
+        puf_prof_on = v && v[0] == '1';
+        if (puf_prof_on) atexit(puf_prof_dump);
+    }
+    return puf_prof_on;
+}
+static inline void puf_prof_add(const char* key, double sec) {
+    std::lock_guard<std::mutex> g(puf_prof_mu);
+    for (int i = 0; i < puf_prof_n; i++) {
+        if (strcmp(puf_prof_tab[i].key, key) == 0) {
+            puf_prof_tab[i].sec += sec;
+            puf_prof_tab[i].calls++;
+            return;
+        }
+    }
+    if (puf_prof_n < 512) {
+        PufProfEntry* e = &puf_prof_tab[puf_prof_n++];
+        snprintf(e->key, sizeof(e->key), "%s", key);
+        e->sec = sec;
+        e->calls = 1;
+    }
+}
+
+struct PufProfScope {
+    const char* name;
+    double t0;
+    PufProfScope(const char* n) : name(n), t0(puf_prof_enabled() ? puf_cpu_now_s() : 0.0) {}
+    ~PufProfScope() {
+        if (puf_prof_on == 1) puf_prof_add(name, puf_cpu_now_s() - t0);
+    }
+};
+#define PUF_HOST_PROF_SCOPE(name) PufProfScope _puf_prof_scope(name)
+
 // Kernel launch
 struct PufLaunchCfg {
     dim3 grid, block;
@@ -268,6 +333,7 @@ static inline PufLaunchCfg puf_cfg(dim3 grid, dim3 block, size_t smem = 0,
 template <class F> struct PufLaunch {
     PufLaunchCfg c;
     F f;
+    const char* name;
 
     template <class... A> void run_block(long b, A&... a) {
         dim3 g = c.grid, bd = c.block;
@@ -291,6 +357,15 @@ template <class F> struct PufLaunch {
     }
 
     template <class... A> void operator()(A... a) {
+        bool prof = puf_prof_enabled();
+        double t0 = prof ? puf_cpu_now_s() : 0.0;
+        launch(a...);
+        if (prof) {
+            puf_prof_add(name, puf_cpu_now_s() - t0);
+        }
+    }
+
+    template <class... A> void launch(A&... a) {
         long nblocks = (long)c.grid.x * c.grid.y * c.grid.z;
         long nthreads = (long)c.block.x * c.block.y * c.block.z;
         if (nblocks <= 0 || nthreads <= 0) {
@@ -309,12 +384,13 @@ template <class F> struct PufLaunch {
         }
     }
 };
-template <class F> static inline PufLaunch<F> puf_launch(PufLaunchCfg c, F f) {
-    return PufLaunch<F>{c, f};
+template <class F> static inline PufLaunch<F> puf_launch(PufLaunchCfg c, F f,
+        const char* name) {
+    return PufLaunch<F>{c, f, name};
 }
 // PUF_LAUNCH(kernel, grid, block[, smem[, stream]])(args...)
 #define PUF_LAUNCH(kernel, ...) \
-    puf_launch(puf_cfg(__VA_ARGS__), [](auto&... _puf_a) { kernel(_puf_a...); })
+    puf_launch(puf_cfg(__VA_ARGS__), [](auto&... _puf_a) { kernel(_puf_a...); }, #kernel)
 
 // cuBLAS (fp32 only)
 typedef struct PufCpuCublas* cublasHandle_t;
@@ -341,11 +417,19 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
     if (m <= 0 || n <= 0) {
         return 0;
     }
+    bool prof = puf_prof_enabled();
+    double t0 = prof ? puf_cpu_now_s() : 0.0;
     cblas_sgemm(PufCblasColMajor,
         ta == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
         tb == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
         m, n, k, *(const float*)alpha, (const float*)A, lda,
         (const float*)B, ldb, *(const float*)beta, (float*)C, ldc);
+    if (prof) {
+        char key[96];
+        snprintf(key, sizeof(key), "sgemm %c%c m=%d n=%d k=%d",
+            ta == CUBLAS_OP_T ? 'T' : 'N', tb == CUBLAS_OP_T ? 'T' : 'N', m, n, k);
+        puf_prof_add(key, puf_cpu_now_s() - t0);
+    }
     return 0;
 }
 
