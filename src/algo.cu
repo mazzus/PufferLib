@@ -199,8 +199,8 @@ void puf_kaiming_init(Prec* dst,
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateUniform(gen, buf, n);
     curandDestroyGenerator(gen);
-    uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
-    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    PUF_LAUNCH(uniform_scale_kernel, grid_size(n), BLOCK_SIZE, 0, stream)(buf, bound, n);
+    PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(dst->data, buf, n);
     cudaFree(buf);
 }
 
@@ -706,12 +706,12 @@ Prec decoder_backward(void* w, void* activations, Float grad_logits,
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
     int od = dw->output_dim, od1 = od + 1;
-    assemble_decoder_grad<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(assemble_decoder_grad, grid_size(B_TT * od1), BLOCK_SIZE, 0, stream)(
         a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, od1);
     // dW // dX: weight grad on side stream, dX on main (needed for residual chain).
     puf_mm_tn_async_after(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.data != NULL) {
-        sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(sum_rows_to_precision_kernel, grid_size(dw->output_dim), BLOCK_SIZE, 0, stream)(
             a->logstd_scratch.data, grad_logstd.data, B_TT, dw->output_dim);
     }
     puf_mm_nn(&a->grad_out, &dw->weight, &a->grad_input, stream);
@@ -837,7 +837,7 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     for (int i = 0; i < m->num_layers; i++) {
         Prec state_i = mingru_state_layer(state, i, 0, B);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
-        mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(mingru_gate, grid_size(B*H), BLOCK_SIZE, 0, stream)(
             a->out.data, a->next_state.data,
             a->combined[i].data, state_i.data, x.data, H, B);
         puf_copy(&state_i, &a->next_state, stream);
@@ -864,9 +864,9 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
                 || scan.T >= 128 && scan.H <= 32) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
-            mingru_scan_forward_row<<<grid, block, 0, stream>>>(scan);
+            PUF_LAUNCH(mingru_scan_forward_row, grid, block, 0, stream)(scan);
         } else {
-            mingru_scan_forward<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream>>>(scan);
+            PUF_LAUNCH(mingru_scan_forward, grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream)(scan);
         }
         x = scan.out;
     }
@@ -890,18 +890,18 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
                 || scan.T >= 128 && scan.H <= 32) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
-            mingru_scan_backward_row<<<grid, block, 0, stream>>>(
+            PUF_LAUNCH(mingru_scan_backward_row, grid, block, 0, stream)(
                 scan, grad.data, a->grad_next_state.data);
         } else {
-            mingru_scan_backward<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0,
-                stream>>>(scan, grad.data, a->grad_next_state.data);
+            PUF_LAUNCH(mingru_scan_backward, grid_size(scan.B * scan.H), BLOCK_SIZE, 0,
+                stream)(scan, grad.data, a->grad_next_state.data);
         }
         // dW on side stream (per-layer scratch); dX on main continues the bwd chain.
         puf_mm_tn_async_after(&scan.grad_combined, &a->saved_inputs[i],
             &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         int n = numel(scan.grad_input.shape);
-        add_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(add_kernel, grid_size(n), BLOCK_SIZE, 0, stream)(
             a->grad_input_buf.data, scan.grad_input.data, n);
         grad = a->grad_input_buf;
     }
@@ -1163,11 +1163,11 @@ void muon_step(Muon* m, Float weights, Prec grads,
         float max_grad_norm, cudaStream_t stream = 0) {
     int n_grad = (int)numel(grads.shape);
     int sum_blocks = min((int)grid_size(n_grad), 256);
-    muon_sum_sq_partials<<<sum_blocks, 256, 0, stream>>>(
+    PUF_LAUNCH(muon_sum_sq_partials, sum_blocks, 256, 0, stream)(
         m->norm_partials, grads.data, n_grad);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+    PUF_LAUNCH(muon_sum_sq_reduce, 1, 256, 0, stream)(
         m->grad_norm, m->norm_partials, sum_blocks);
-    muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(muon_clip_nesterov, grid_size(n_grad), BLOCK_SIZE, 0, stream)(
         m->mb.data, grads.data, m->grad_norm,
         max_grad_norm, 1e-6f, (float)m->momentum, n_grad);
 
@@ -1192,11 +1192,11 @@ void muon_step(Muon* m, Float weights, Prec grads,
         Prec gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
 
         int nblk = min((int)grid_size(ne), 256);
-        muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(
+        PUF_LAUNCH(muon_sum_sq_partials, nblk, 256, 0, stream)(
             m->norm_partials, x.data, (int)ne);
-        muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+        PUF_LAUNCH(muon_sum_sq_reduce, 1, 256, 0, stream)(
             m->ns_norm, m->norm_partials, nblk);
-        muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(muon_l2_normalize, grid_size(ne), BLOCK_SIZE, 0, stream)(
             x.data, m->ns_norm, 1e-7f, (int)ne);
 
         // 5 steps land in x_buf. 4 = you break it.
@@ -1221,10 +1221,10 @@ void muon_step(Muon* m, Float weights, Prec grads,
             }
         }
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(muon_store_update, grid_size(ne), BLOCK_SIZE, 0, stream)(
             gc_ptr, x_buf.data, scale, (int)ne);
     }
-    muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(muon_weight_update, grid_size(n_grad), BLOCK_SIZE, 0, stream)(
         weights.data, grads.data, m->lr, 0.0f, n_grad);
 }
 
@@ -1487,7 +1487,7 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
-    cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(cache_imp_and_v, grid_size(B * TT), BLOCK_SIZE, 0, stream)(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
         logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
     return dec;
@@ -1678,9 +1678,9 @@ void ppo_loss_fwd_bwd(
         .T_seq = T, .A_total = A_total, .N = N,
         .is_continuous = is_continuous,
     };
-    ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
+    PUF_LAUNCH(ppo_loss_compute, ppo_grid, PPO_THREADS, 0, stream)(
             bufs.ppo_partials.data, args, graph_args);
-    ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
+    PUF_LAUNCH(ppo_loss_reduce, 1, LOSS_N, 0, stream)(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }
 
