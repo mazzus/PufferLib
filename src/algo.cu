@@ -851,7 +851,7 @@ static inline float host_lerp(float a, float b, float w) {
 static void mingru_gate_host(precision_t* out, precision_t* next_state,
         const precision_t* combined, const precision_t* state_in,
         const precision_t* x_in, int H, int B) {
-    PUF_HOST_PROF_SCOPE("mingru_gate_host");
+    PUF_HOST_KERNEL_SCOPE("mingru_gate_host");
     #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H >= 65536)
     for (int b = 0; b < B; b++) {
         const precision_t* c = combined + (long)b * 3 * H;
@@ -870,7 +870,7 @@ static void mingru_gate_host(precision_t* out, precision_t* next_state,
 }
 
 static void mingru_scan_forward_host(PrefixScan scan) {
-    PUF_HOST_PROF_SCOPE("mingru_scan_forward_host");
+    PUF_HOST_KERNEL_SCOPE("mingru_scan_forward_host");
     int T = scan.T, H = scan.H, B = scan.B;
     #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H * T >= 65536)
     for (int b = 0; b < B; b++) {
@@ -904,7 +904,7 @@ static void mingru_scan_forward_host(PrefixScan scan) {
 
 static void mingru_scan_backward_host(PrefixScan scan,
         const precision_t* grad_out, const precision_t* grad_next_state) {
-    PUF_HOST_PROF_SCOPE("mingru_scan_backward_host");
+    PUF_HOST_KERNEL_SCOPE("mingru_scan_backward_host");
     int T = scan.T, H = scan.H, B = scan.B;
     #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H * T >= 65536)
     for (int b = 0; b < B; b++) {

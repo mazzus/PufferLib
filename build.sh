@@ -8,6 +8,7 @@ set -e
 #   ./build.sh robot_arm             # CUDA-only; implies --cu
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
 #   ./build.sh breakout --cpu        # Play/eval binary (optimized) -> ./ENV
+#   ./build.sh breakout --metal      # macOS: CPU trainer + Metal GPU backend
 #   ./build.sh osrs_inferno --cpu     # OSRS visual policy viewer -> ./osrs_inferno
 #   ./build.sh nethack --cpu          # NetHack TTY demo (ocean/nethack/nethack.c)
 #   ./build.sh breakout myplay --cpu # Play -> ./myplay
@@ -45,6 +46,7 @@ while [ $# -gt 0 ]; do
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
         --cpu)   MODE=cpu ;;
+        --metal) USE_METAL=1 ;;
         *) echo "Error: unknown argument '$1'" && exit 1 ;;
     esac
     shift
@@ -439,19 +441,28 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     else
         CPU_OPT=(-O2 -g)
     fi
-    echo "Compiling $ENV_HEADER -> $TRAIN_BIN (CPU trainer)..."
+    METAL_SRC=()
+    METAL_FLAGS=()
+    BACKEND_NAME="CPU trainer"
+    if [ "${USE_METAL:-0}" = "1" ]; then
+        METAL_FLAGS=(-DPUF_TRAIN_METAL)
+        METAL_SRC=(-x objective-c++ -fobjc-arc src/puf_metal.mm)
+        EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation)
+        BACKEND_NAME="CPU trainer + Metal"
+    fi
+    echo "Compiling $ENV_HEADER -> $TRAIN_BIN ($BACKEND_NAME)..."
     ${CXX:-clang++} -std=c++17 "${CPU_OPT[@]}" "${SIMD_FLAGS[@]}" -fveclib=Darwin_libsystem_m \
         -Wno-narrowing -Wno-c99-designator -Wno-unreachable-code \
         -Wno-vla-cxx-extension -Wno-unused-function -Wno-unused-variable \
         -I. -Isrc -I$SRC_DIR -Ivendor "${INCLUDES[@]}" \
-        -DPUF_TRAIN_CPU -DPRECISION_FLOAT \
+        -DPUF_TRAIN_CPU -DPRECISION_FLOAT "${METAL_FLAGS[@]}" \
         -DENV_HEADER=\"$ENV_HEADER\" \
         -DENV_NAME=$ENV \
         -DPUFFER_ENV_NAME=\"$ENV\" \
         -DPUFFERLIB_BUILD_MAIN \
         -DPLATFORM_DESKTOP \
         "${EXTRA_CFLAGS[@]}" \
-        -x c++ src/pufferl.cu -x c $EXTRA_SRC -x none \
+        -x c++ src/pufferl.cu -x c $EXTRA_SRC "${METAL_SRC[@]}" -x none \
         "${LINK_ARCHIVES[@]}" \
         "${EXTRA_LDFLAGS[@]}" \
         "${OMP_FLAGS[@]}" \

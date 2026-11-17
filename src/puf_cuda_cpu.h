@@ -48,6 +48,16 @@ typedef unsigned long ulong;
 
 constexpr bool PUF_HOST_KERNELS = true;
 
+// Metal backend (-DPUF_TRAIN_METAL): device memory is a shared MTLBuffer arena,
+// GEMMs/copies/fills run on the GPU, and ported kernels dispatch to Metal.
+// Anything else runs on the host after flushing the thread's GPU work.
+#ifdef PUF_TRAIN_METAL
+#include "puf_metal.h"
+#define PUF_METAL_FLUSH() puf_metal_flush()
+#else
+#define PUF_METAL_FLUSH() ((void)0)
+#endif
+
 [[noreturn]] static inline void puf_cpu_fatal(const char* what) {
     fprintf(stderr, "PUF_TRAIN_CPU: unsupported: %s\n", what);
     abort();
@@ -166,7 +176,20 @@ static inline unsigned long long puf_cpu_now_ns() {
     return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+static inline cudaError_t puf_cpu_host_malloc(void** p, size_t n) {
+    void* mem = NULL;
+    if (posix_memalign(&mem, 64, n ? n : 64) != 0) {
+        return 2;
+    }
+    memset(mem, 0, n);
+    *p = mem;
+    return cudaSuccess;
+}
 static inline cudaError_t puf_cpu_malloc(void** p, size_t n) {
+#ifdef PUF_TRAIN_METAL
+    *p = puf_metal_alloc(n);
+    return cudaSuccess;
+#endif
     void* mem = NULL;
     if (posix_memalign(&mem, 64, n ? n : 64) != 0) {
         return 2;
@@ -179,11 +202,28 @@ template <class T> static inline cudaError_t cudaMalloc(T** p, size_t n) {
     return puf_cpu_malloc((void**)p, n);
 }
 template <class T> static inline cudaError_t cudaHostAlloc(T** p, size_t n, unsigned) {
-    return puf_cpu_malloc((void**)p, n);
+    return puf_cpu_host_malloc((void**)p, n);
 }
-static inline cudaError_t cudaFree(void* p) { free(p); return cudaSuccess; }
+static inline cudaError_t cudaFree(void* p) {
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(p)) {
+        puf_metal_free(p);
+        return cudaSuccess;
+    }
+#endif
+    free(p);
+    return cudaSuccess;
+}
 static inline cudaError_t cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind) {
-    if (n) memmove(d, s, n);
+    if (!n) return cudaSuccess;
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(d) && puf_metal_owns(s)) {
+        puf_metal_copy(d, s, n);
+        return cudaSuccess;
+    }
+    puf_metal_flush();
+#endif
+    memmove(d, s, n);
     return cudaSuccess;
 }
 static inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n,
@@ -191,7 +231,14 @@ static inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n,
     return cudaMemcpy(d, s, n, k);
 }
 static inline cudaError_t cudaMemset(void* p, int v, size_t n) {
-    if (n) memset(p, v, n);
+    if (!n) return cudaSuccess;
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(p)) {
+        puf_metal_fill(p, v, n);
+        return cudaSuccess;
+    }
+#endif
+    memset(p, v, n);
     return cudaSuccess;
 }
 static inline cudaError_t cudaMemsetAsync(void* p, int v, size_t n, cudaStream_t = 0) {
@@ -204,7 +251,7 @@ static inline cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
 }
 static inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
 static inline cudaError_t cudaGetDeviceCount(int* n) { *n = 1; return cudaSuccess; }
-static inline cudaError_t cudaDeviceSynchronize() { return cudaSuccess; }
+static inline cudaError_t cudaDeviceSynchronize() { PUF_METAL_FLUSH(); return cudaSuccess; }
 static inline cudaError_t cudaProfilerStart() { return cudaSuccess; }
 static inline cudaError_t cudaProfilerStop() { return cudaSuccess; }
 
@@ -215,7 +262,7 @@ static inline cudaError_t cudaStreamCreate(cudaStream_t* s) {
 static inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned) {
     return cudaStreamCreate(s);
 }
-static inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+static inline cudaError_t cudaStreamSynchronize(cudaStream_t) { PUF_METAL_FLUSH(); return cudaSuccess; }
 static inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) {
     return cudaSuccess;
 }
@@ -274,6 +321,11 @@ static inline void puf_prof_dump() {
         }
     }
     fprintf(stderr, "\nPUF_CPU_PROFILE (total %.2fs)\n", total);
+#ifdef PUF_TRAIN_METAL
+    long fl, gm, dp, bl;
+    puf_metal_stats(&fl, &gm, &dp, &bl);
+    fprintf(stderr, "metal: flushes=%ld gemms=%ld dispatches=%ld blits=%ld\n", fl, gm, dp, bl);
+#endif
     for (int i = 0; i < puf_prof_n && i < 40; i++) {
         PufProfEntry* e = &puf_prof_tab[i];
         fprintf(stderr, "%8.3fs %5.1f%% %9ld  %s\n", e->sec, 100 * e->sec / total,
@@ -305,15 +357,19 @@ static inline void puf_prof_add(const char* key, double sec) {
     }
 }
 
+// Entry of a host-native kernel (reads/writes device memory on the host).
 struct PufProfScope {
     const char* name;
     double t0;
-    PufProfScope(const char* n) : name(n), t0(puf_prof_enabled() ? puf_cpu_now_s() : 0.0) {}
+    PufProfScope(const char* n) : name(n), t0(0.0) {
+        PUF_METAL_FLUSH();
+        t0 = puf_prof_enabled() ? puf_cpu_now_s() : 0.0;
+    }
     ~PufProfScope() {
         if (puf_prof_on == 1) puf_prof_add(name, puf_cpu_now_s() - t0);
     }
 };
-#define PUF_HOST_PROF_SCOPE(name) PufProfScope _puf_prof_scope(name)
+#define PUF_HOST_KERNEL_SCOPE(name) PufProfScope _puf_prof_scope(name)
 
 // Kernel launch
 struct PufLaunchCfg {
@@ -357,6 +413,7 @@ template <class F> struct PufLaunch {
     }
 
     template <class... A> void operator()(A... a) {
+        PUF_METAL_FLUSH();
         bool prof = puf_prof_enabled();
         double t0 = prof ? puf_cpu_now_s() : 0.0;
         launch(a...);
@@ -419,6 +476,18 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
     }
     bool prof = puf_prof_enabled();
     double t0 = prof ? puf_cpu_now_s() : 0.0;
+#ifdef PUF_TRAIN_METAL
+    puf_metal_sgemm(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
+        *(const float*)alpha, (const float*)A, lda, (const float*)B, ldb,
+        *(const float*)beta, (float*)C, ldc);
+    if (prof) {
+        char key[96];
+        snprintf(key, sizeof(key), "mps sgemm %c%c m=%d n=%d k=%d (encode)",
+            ta == CUBLAS_OP_T ? 'T' : 'N', tb == CUBLAS_OP_T ? 'T' : 'N', m, n, k);
+        puf_prof_add(key, puf_cpu_now_s() - t0);
+    }
+    return 0;
+#endif
     cblas_sgemm(PufCblasColMajor,
         ta == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
         tb == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
@@ -542,6 +611,7 @@ static inline curandStatus_t curandSetPseudoRandomGeneratorSeed(
     return 0;
 }
 static inline curandStatus_t curandGenerateUniform(curandGenerator_t g, float* out, size_t n) {
+    PUF_METAL_FLUSH();
     curandStatePhilox4_32_10_t s;
     curand_init(g->seed, 0, 0, &s);
     for (size_t i = 0; i < n; i++) {
@@ -551,6 +621,7 @@ static inline curandStatus_t curandGenerateUniform(curandGenerator_t g, float* o
 }
 static inline curandStatus_t curandGenerateNormal(curandGenerator_t g, float* out,
         size_t n, float mean, float stddev) {
+    PUF_METAL_FLUSH();
     curandStatePhilox4_32_10_t s;
     curand_init(g->seed, 0, 0, &s);
     for (size_t i = 0; i + 1 < n + 1; i += 2) {
