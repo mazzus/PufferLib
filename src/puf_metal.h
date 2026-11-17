@@ -20,6 +20,8 @@ extern "C" {
 #endif
 
 void puf_metal_init(void);
+// Preprocessor macro for the kernel library (call before the first kernel use).
+void puf_metal_define(const char* name, long value);
 // Zeroed, 256-byte aligned arena allocation. Never NULL (aborts when out of memory).
 void* puf_metal_alloc(size_t bytes);
 void puf_metal_free(void* p);

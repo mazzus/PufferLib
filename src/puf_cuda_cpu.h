@@ -54,8 +54,11 @@ constexpr bool PUF_HOST_KERNELS = true;
 #ifdef PUF_TRAIN_METAL
 #include "puf_metal.h"
 #define PUF_METAL_FLUSH() puf_metal_flush()
+// MinGRU uses the GPU-portable kernels (ported to Metal) instead of host versions
+constexpr bool PUF_HOST_MINGRU = false;
 #else
 #define PUF_METAL_FLUSH() ((void)0)
+constexpr bool PUF_HOST_MINGRU = true;
 #endif
 
 [[noreturn]] static inline void puf_cpu_fatal(const char* what) {
@@ -79,7 +82,7 @@ struct dim3 {
         : x(x_), y(y_), z(z_) {}
 };
 struct float4 { float x, y, z, w; };
-struct uint4 { unsigned int x, y, z, w; };
+struct alignas(16) uint4 { unsigned int x, y, z, w; };
 struct uint2 { unsigned int x, y; };
 static inline float4 make_float4(float x, float y, float z, float w) {
     return {x, y, z, w};
@@ -381,12 +384,94 @@ static inline PufLaunchCfg puf_cfg(dim3 grid, dim3 block, size_t smem = 0,
     return {grid, block, smem};
 }
 
+// Metal kernel ports. A ported kernel gets one overload of puf_metal_try for
+// its kernel id (declared next to the CUDA kernel via PUF_METAL_PORT). The
+// overload has the kernel's exact parameter types, so overloaded kernels
+// resolve as in CUDA, and marshals the parameters (in order, natural
+// alignment, arena pointers as GPU addresses) into the MSL argument struct.
+// The variadic fallback (worst conversion rank) means "not ported".
+constexpr uint64_t puf_hash(const char* s) {
+    uint64_t h = 1469598103934665603ull;
+    while (*s) {
+        h = (h ^ (uint64_t)(unsigned char)*s++) * 1099511628211ull;
+    }
+    return h;
+}
+template <uint64_t H> struct PufKernelId {};
+struct PufLaunchCfg;
+template <uint64_t H>
+static inline bool puf_metal_try(PufKernelId<H>, const PufLaunchCfg&, ...) {
+    return false;
+}
+
+struct PufArgWriter {
+    alignas(16) unsigned char buf[2048];
+    size_t len = 0;
+    bool ok = true;
+    void align(size_t a) { len = (len + a - 1) & ~(a - 1); }
+    void raw(const void* p, size_t n, size_t a) {
+        align(a);
+        if (len + n > sizeof(buf)) { ok = false; return; }
+        memcpy(buf + len, p, n);
+        len += n;
+    }
+    template <class... A> bool put(const A&... a);
+};
+#ifdef PUF_TRAIN_METAL
+template <class T> static inline void puf_put(PufArgWriter& w, T* p) {
+    if (p != NULL && !puf_metal_owns(p)) {
+        w.ok = false;  // host pointer: cannot run on the GPU
+    }
+    uint64_t a = puf_metal_gpu_address(w.ok ? p : NULL);
+    w.raw(&a, 8, 8);
+}
+#endif
+static inline void puf_put(PufArgWriter& w, int v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, unsigned int v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, float v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, bool v) { w.raw(&v, 1, 1); }
+static inline void puf_put(PufArgWriter& w, long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, long long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, unsigned long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, unsigned long long v) { w.raw(&v, 8, 8); }
+template <class... A> bool PufArgWriter::put(const A&... a) {
+    (puf_put(*this, a), ...);
+    align(16);
+    return ok;
+}
+#define PUF_UNPAREN(...) __VA_ARGS__
+#ifdef PUF_TRAIN_METAL
+// PUF_METAL_PORT(kernel, "msl_name", (param decls), (param names))
+#define PUF_METAL_PORT(kernel, msl, params, args) \
+    static inline bool puf_metal_try(PufKernelId<puf_hash(#kernel)>, \
+            const PufLaunchCfg& _c, PUF_UNPAREN params) { \
+        PufArgWriter _w; \
+        if (!_w.put args) return false; \
+        return puf_metal_launch(msl, _c, _w); \
+    }
+#else
+#define PUF_METAL_PORT(kernel, msl, params, args)
+#endif
+
 // Below this many total threads, run blocks on the calling thread.
 #ifndef PUF_CPU_PAR_MIN_THREADS
 #define PUF_CPU_PAR_MIN_THREADS 32768
 #endif
 
-template <class F> struct PufLaunch {
+#ifdef PUF_TRAIN_METAL
+// Set to force every kernel onto the CPU emulation (differential tests).
+inline bool puf_metal_force_cpu = false;
+static inline bool puf_metal_launch(const char* msl, const PufLaunchCfg& c, PufArgWriter& w) {
+    if (puf_metal_force_cpu || !puf_metal_has_kernel(msl)) {
+        return false;
+    }
+    puf_metal_dispatch(msl, c.grid.x, c.grid.y, c.grid.z, c.block.x, c.block.y,
+        c.block.z, w.buf, w.len);
+    return true;
+}
+#endif
+
+template <uint64_t H, class F> struct PufLaunch {
     PufLaunchCfg c;
     F f;
     const char* name;
@@ -413,9 +498,20 @@ template <class F> struct PufLaunch {
     }
 
     template <class... A> void operator()(A... a) {
-        PUF_METAL_FLUSH();
         bool prof = puf_prof_enabled();
         double t0 = prof ? puf_cpu_now_s() : 0.0;
+#ifdef PUF_TRAIN_METAL
+        if (puf_metal_try(PufKernelId<H>{}, c, a...)) {
+            if (prof) {
+                char key[96];
+                snprintf(key, sizeof(key), "metal %s (encode)", name);
+                puf_prof_add(key, puf_cpu_now_s() - t0);
+            }
+            return;
+        }
+#endif
+        PUF_METAL_FLUSH();
+        if (prof) t0 = puf_cpu_now_s();
         launch(a...);
         if (prof) {
             puf_prof_add(name, puf_cpu_now_s() - t0);
@@ -441,13 +537,14 @@ template <class F> struct PufLaunch {
         }
     }
 };
-template <class F> static inline PufLaunch<F> puf_launch(PufLaunchCfg c, F f,
-        const char* name) {
-    return PufLaunch<F>{c, f, name};
+template <uint64_t H, class F> static inline PufLaunch<H, F> puf_launch(PufLaunchCfg c,
+        F f, const char* name) {
+    return PufLaunch<H, F>{c, f, name};
 }
 // PUF_LAUNCH(kernel, grid, block[, smem[, stream]])(args...)
 #define PUF_LAUNCH(kernel, ...) \
-    puf_launch(puf_cfg(__VA_ARGS__), [](auto&... _puf_a) { kernel(_puf_a...); }, #kernel)
+    puf_launch<puf_hash(#kernel)>(puf_cfg(__VA_ARGS__), \
+        [](auto&... _puf_a) { kernel(_puf_a...); }, #kernel)
 
 // cuBLAS (fp32 only)
 typedef struct PufCpuCublas* cublasHandle_t;
@@ -505,7 +602,8 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
 // cuRAND: Philox4x32-10 (Salmon et al. 2011), counter = (ctr, subsequence),
 // key = seed. Layout and semantics follow cuRAND's device API; outputs are not
 // guaranteed to be bit-identical to cuRAND.
-struct curandStatePhilox4_32_10_t {
+// alignas(16): same 64-byte layout as the MSL struct (uint4 is 16-aligned there)
+struct alignas(16) curandStatePhilox4_32_10_t {
     uint4 ctr;
     uint4 output;
     uint2 key;

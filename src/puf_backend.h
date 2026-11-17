@@ -27,4 +27,6 @@
 // True when kernels run as host loops (no CUDA graphs, no cooperative blocks).
 constexpr bool PUF_HOST_KERNELS = false;
 #define PUF_HOST_KERNEL_SCOPE(name)
+constexpr bool PUF_HOST_MINGRU = false;
+#define PUF_METAL_PORT(kernel, msl, params, args)
 #endif

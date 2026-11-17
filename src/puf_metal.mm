@@ -34,6 +34,7 @@ static std::vector<Chunk> g_chunks;           // guarded by g_mu
 static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResources
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipes;
 static std::unordered_map<std::string, MPSMatrixMultiplication*> g_gemms;
+static NSMutableDictionary* g_macros = nil;
 static std::atomic<long> g_flushes{0}, g_gemm_n{0}, g_dispatch_n{0}, g_blit_n{0};
 
 static const size_t kChunk = (size_t)1 << 30;
@@ -80,6 +81,7 @@ static void load_library() {
         return;
     }
     MTLCompileOptions* opts = [MTLCompileOptions new];
+    if (g_macros) opts.preprocessorMacros = g_macros;
     if (@available(macOS 15.0, *)) {
         opts.mathMode = MTLMathModeSafe;
         opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
@@ -96,6 +98,13 @@ static void load_library() {
             [[err description] UTF8String]);
         abort();
     }
+}
+
+extern "C" void puf_metal_define(const char* name, long value) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    if (!g_macros) g_macros = [NSMutableDictionary new];
+    g_macros[[NSString stringWithUTF8String:name]] = @(value);
 }
 
 extern "C" void puf_metal_init(void) {
