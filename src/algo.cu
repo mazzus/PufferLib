@@ -860,8 +860,8 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.state_ptr = state_i.data;
         scan.input_ptr = a->saved_inputs[i].data;
         scan.terminals_ptr = terminals.data;
-        if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_forward_row, grid, block, 0, stream)(scan);
@@ -886,8 +886,8 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
-        if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_backward_row, grid, block, 0, stream)(
@@ -973,7 +973,7 @@ Activations arch_reg_rollout(Arch* p, Weights& w,
 }
 
 void weights_init(Arch* p, Weights& w,
-        uint64_t* seed, cudaStream_t stream) {
+        ulong* seed, cudaStream_t stream) {
     p->encoder.init_weights(w.encoder, seed, stream);
     p->decoder.init_weights(w.decoder, seed, stream);
     p->network.init_weights(w.network, seed, stream);

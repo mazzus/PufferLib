@@ -211,7 +211,7 @@ __global__ void cast_rew_term(
 // Allocates large buffers (params/acts/grads) in contiguous memory.
 struct AllocEntry {
     void** data_ptr;
-    long* shape;
+    int64_t* shape;
     int elem_size;
 };
 
@@ -224,7 +224,7 @@ struct Allocator {
 };
 
 void _alloc_register(Allocator* alloc,
-        void** data_ptr, long* shape, int elem_size) {
+        void** data_ptr, int64_t* shape, int elem_size) {
     alloc->regs = (AllocEntry*)realloc(alloc->regs,
         (alloc->num_regs + 1) * sizeof(AllocEntry));
     alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
@@ -283,7 +283,9 @@ __device__ __forceinline__ void block_reduce_sum(
 
 // Algo + sweeps only depend on basic tensor types and utilities
 #include "algo.cu"
+#ifndef PUF_TRAIN_CPU
 #include "protein.cu"
+#endif
 
 typedef struct {
     int horizon;
@@ -1444,9 +1446,13 @@ __global__ void clamp_precision_kernel(precision_t* dst, float lo, float hi, int
 
 // 1-thread graph node. cudaEventElapsedTime does not timestamp in-graph events.
 __global__ void puf_stamp(unsigned long long* dst) {
+#ifdef PUF_TRAIN_CPU
+    *dst = puf_cpu_now_ns();
+#else
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     *dst = t;
+#endif
 }
 
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
@@ -1797,7 +1803,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .vtrace_c_clip = puf_ini_get(ini, "train", "vtrace_c_clip"),
         .async = puf_ini_get(ini, "base", "async") != 0,
         .reset_every_horizon = puf_ini_get(ini, "base", "reset_every_horizon") != 0,
-        .cudagraphs = puf_ini_get(ini, "base", "cudagraphs") >= 0,
+        .cudagraphs = !PUF_HOST_KERNELS
+            && puf_ini_get(ini, "base", "cudagraphs") >= 0,
         .profile = puf_ini_get(ini, "base", "profile") != 0,
         .rank = ctx->rank,
         .world_size = ctx->world_size,
@@ -2559,6 +2566,12 @@ typedef struct {
     TrainResult result;
 } SweepJob;
 
+#ifdef PUF_TRAIN_CPU
+void run_sweep(Ini*, const char*) {
+    fprintf(stderr, "sweep: Protein needs cuSOLVER; not available in the CPU trainer\n");
+    exit(1);
+}
+#else
 void run_sweep(Ini* ini, const char* exe_path) {
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
@@ -2832,6 +2845,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         completed++;
     }
 }
+#endif
 
 // Sweep objective: bare names → env/<name>; keys with '/' used as-is.
 static void sweep_metric_key(Ini* ini, char* buf, size_t n) {

@@ -24,4 +24,6 @@
 #define PUF_LAUNCH(kernel, ...) kernel<<<__VA_ARGS__>>>
 // Dynamic shared memory declaration (extern __shared__ T name[]).
 #define PUF_DYN_SHARED(T, name) extern __shared__ T name[]
+// True when kernels run as host loops (no CUDA graphs, no cooperative blocks).
+constexpr bool PUF_HOST_KERNELS = false;
 #endif
