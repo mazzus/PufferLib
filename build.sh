@@ -83,7 +83,7 @@ PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_FLAGS=(-fopenmp)
-    OMP_LIB=-lomp5
+    OMP_LIB=${OMP_LIB:--lomp5}
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
 else
@@ -205,7 +205,7 @@ else
 fi
 
 # src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, …).
-EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
+EXTRA_CFLAGS+=(-DPUFFER_$(echo "$ENV" | tr a-z A-Z))
 
 case "$ENV" in
     osrs_*)
@@ -425,11 +425,16 @@ CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
 # Needed when NCCL is provided by the nvidia-nccl-cu12 wheel in the active venv.
 NCCL_IFLAG=""
 NCCL_LFLAG=""
+# NCCL_HOME: unpacked NCCL (include/ + lib/) when it is not installed system-wide
+if [ -n "${NCCL_HOME:-}" ]; then
+    NCCL_IFLAG="-I$NCCL_HOME/include"
+    NCCL_LFLAG="-L$NCCL_HOME/lib -Xlinker -rpath -Xlinker $NCCL_HOME/lib"
+fi
 for dir in /usr/include /usr/local/cuda/include; do
-    if [ -f "$dir/nccl.h" ]; then NCCL_IFLAG="-I$dir"; break; fi
+    if [ -z "$NCCL_IFLAG" ] && [ -f "$dir/nccl.h" ]; then NCCL_IFLAG="-I$dir"; break; fi
 done
 for dir in /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64; do
-    if [ -f "$dir/libnccl.so" ] || [ -f "$dir/libnccl.so.2" ]; then NCCL_LFLAG="-L$dir"; break; fi
+    if [ -z "$NCCL_LFLAG" ] && { [ -f "$dir/libnccl.so" ] || [ -f "$dir/libnccl.so.2" ]; }; then NCCL_LFLAG="-L$dir"; break; fi
 done
 if [ -z "$NCCL_IFLAG" ]; then
     NCCL_IFLAG=$(python -c "import nvidia.nccl, os; print('-I' + os.path.join(nvidia.nccl.__path__[0], 'include'))" 2>/dev/null || echo "")
@@ -441,7 +446,7 @@ fi
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
-NVCC="ccache $CUDA_HOME/bin/nvcc"
+NVCC="$(command -v ccache >/dev/null && echo ccache || true) $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 ARCH=${NVCC_ARCH:-native}
 
