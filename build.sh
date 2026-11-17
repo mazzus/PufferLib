@@ -446,7 +446,7 @@ fi
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
-NVCC="$(command -v ccache >/dev/null && echo ccache) $CUDA_HOME/bin/nvcc"
+NVCC="$(command -v ccache >/dev/null && echo ccache || true) $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 ARCH=${NVCC_ARCH:-native}
 
