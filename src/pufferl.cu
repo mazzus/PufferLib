@@ -1,13 +1,5 @@
-// CUDA
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cuda_profiler_api.h>
-#include <cublas_v2.h>
-#include <curand.h>
-#include <curand_kernel.h>
-#include <nccl.h>
-#include <nvml.h>
-#include <nvtx3/nvToolsExt.h>
+// CUDA (or the CPU implementation of it, -DPUF_TRAIN_CPU)
+#include "puf_backend.h"
 
 // C standard
 #include <cassert>
@@ -219,7 +211,7 @@ __global__ void cast_rew_term(
 // Allocates large buffers (params/acts/grads) in contiguous memory.
 struct AllocEntry {
     void** data_ptr;
-    long* shape;
+    int64_t* shape;
     int elem_size;
 };
 
@@ -232,7 +224,7 @@ struct Allocator {
 };
 
 void _alloc_register(Allocator* alloc,
-        void** data_ptr, long* shape, int elem_size) {
+        void** data_ptr, int64_t* shape, int elem_size) {
     alloc->regs = (AllocEntry*)realloc(alloc->regs,
         (alloc->num_regs + 1) * sizeof(AllocEntry));
     alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
@@ -291,7 +283,9 @@ __device__ __forceinline__ void block_reduce_sum(
 
 // Algo + sweeps only depend on basic tensor types and utilities
 #include "algo.cu"
+#ifndef PUF_TRAIN_CPU
 #include "protein.cu"
+#endif
 
 typedef struct {
     int horizon;
@@ -806,13 +800,13 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             obs_env->data + (long)start * obs_env->shape[1],
             n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
     } else {
-        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(
             obs_dst.data, obs_env->data + (long)start * obs_env->shape[1], n);
     }
 
     Prec rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     Prec term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    cast_rew_term<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(cast_rew_term, grid_size(block_size), BLOCK_SIZE, 0, stream)(
         rew_dst.data, env->rewards.data + start,
         term_dst.data, env->terminals.data + start, block_size);
 
@@ -820,7 +814,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     int mask_size = rollouts.action_mask.shape[2];
     int mask_stride = mask_size;
     Prec mask_slice = puf_slice(rollouts.action_mask, t, start, block_size);
-    cast<<<grid_size(block_size * mask_size), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(cast, grid_size(block_size * mask_size), BLOCK_SIZE, 0, stream)(
         mask_slice.data,
         env->action_mask.data + (long)start * mask_size,
         block_size * mask_size);
@@ -849,13 +843,13 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
 
         // Per-policy state is compact (n agents); local index 0..n-1.
         int state_n = (int)st->shape[0] * n * (int)st->shape[2];
-        zero_term_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(zero_term_state, grid_size(state_n), BLOCK_SIZE, 0, stream)(
             *st, env->terminals, 0, sub, n);
 
         // Carry path: snapshot trainable policy state into per-slot initial_states.
         if (!pol->frozen && t == 0 && rollouts.initial_states.data != NULL) {
             Prec slot_st = init_slot(rollouts.initial_states, graph_slot);
-            snapshot_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+            PUF_LAUNCH(snapshot_state, grid_size(state_n), BLOCK_SIZE, 0, stream)(
                 slot_st, *st, sub, n);
         }
 
@@ -868,7 +862,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         }
 
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
-        sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(sample_logits, grid_size(n), BLOCK_SIZE, 0, stream)(
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
@@ -939,7 +933,7 @@ __host__ __device__ static inline void log_accum(float* acc, Log* log, int clear
 
 __global__ void log_reduce(Env* envs,
         float* out, int total_agents, int clear) {
-    extern __shared__ float sh[];
+    PUF_DYN_SHARED(float, sh);
     int tid = threadIdx.x;
     float local[LOG_NF] = {};
     for (int i = tid; i < total_agents / envs->num_agents; i += blockDim.x) {
@@ -953,7 +947,7 @@ __global__ void log_reduce(Env* envs,
 
 static void env_log_sum(VecEnv* vec, Log* out, int clear) {
     if (PUF_BACKEND == PUF_GPU) {
-        log_reduce<<<1, 256, LOG_NF * 256 * sizeof(float)>>>(
+        PUF_LAUNCH(log_reduce, 1, 256, LOG_NF * 256 * sizeof(float))(
             vec->envs, vec->log_scratch, vec->total_agents, clear);
         cudaMemcpy(out, vec->log_scratch, sizeof(Log), cudaMemcpyDeviceToHost);
         return;
@@ -1452,9 +1446,13 @@ __global__ void clamp_precision_kernel(precision_t* dst, float lo, float hi, int
 
 // 1-thread graph node. cudaEventElapsedTime does not timestamp in-graph events.
 __global__ void puf_stamp(unsigned long long* dst) {
+#ifdef PUF_TRAIN_CPU
+    *dst = puf_cpu_now_ns();
+#else
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     *dst = t;
+#endif
 }
 
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
@@ -1462,30 +1460,30 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf* rollouts = &pufferl->train_rollouts;
     unsigned long long* st = pufferl->profile.stamps + slot * NUM_TE;
-    puf_stamp<<<1, 1, 0, stream>>>(st + TE_S);
+    PUF_LAUNCH(puf_stamp, 1, 1, 0, stream)(st + TE_S);
 
     int T = src.observations.shape[0];
     int B = src.observations.shape[1];
     int obs_size = (int)src.observations.shape[2];
     int num_atns = (int)src.actions.shape[2];
     int mask_c = src.action_mask.shape[2];
-    transpose_102<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B * obs_size), BLOCK_SIZE, 0, stream)(
         rollouts->observations.data, src.observations.data, T, B, obs_size);
-    transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream)(
         rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B), BLOCK_SIZE, 0, stream)(
         rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B), BLOCK_SIZE, 0, stream)(
         rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B), BLOCK_SIZE, 0, stream)(
         rollouts->terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B), BLOCK_SIZE, 0, stream)(
         rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(transpose_102, grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream)(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
 
-    clamp_precision_kernel<<<grid_size(
-        numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(clamp_precision_kernel, grid_size(
+        numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream)(
         rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
@@ -1497,7 +1495,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             numel(pufferl->train_state.shape) * sizeof(precision_t),
             cudaMemcpyDeviceToDevice, stream);
     }
-    puf_stamp<<<1, 1, 0, stream>>>(st + TE_MID);
+    PUF_LAUNCH(puf_stamp, 1, 1, 0, stream)(st + TE_MID);
 
     int batch_size = hypers->total_agents * hypers->horizon;
     int mb_segs = hypers->minibatch_size / hypers->horizon;
@@ -1529,7 +1527,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
             pufferl->ppo_bufs.grad_values.data, stream);
-        puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
+        PUF_LAUNCH(puff_advantage, adv_grid, ADV_THREADS, 0, stream)(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
             hypers->vtrace ? graph.mb_imp.data : NULL,
@@ -1560,11 +1558,11 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->grad, hypers->max_grad_norm, stream);
         if (USE_BF16) {
             int n = numel(primary->param.shape);
-            cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(
                 primary->param.data, primary->master_weights.data, n);
         }
     }
-    puf_stamp<<<1, 1, 0, stream>>>(st + TE_E);
+    PUF_LAUNCH(puf_stamp, 1, 1, 0, stream)(st + TE_E);
 }
 
 void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
@@ -1748,7 +1746,7 @@ void puf_load_weights_into(Float dst, Prec params,
     free(buf);
     if (USE_BF16) {
         int n = numel(params.shape);
-        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(params.data, dst.data, n);
+        PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(params.data, dst.data, n);
     }
 }
 
@@ -1770,7 +1768,7 @@ static void master_weights_setup(Float* mw, Prec* param,
         *mw = (Float){.shape = {n}};
         cudaMalloc((void**)&mw->data, n * sizeof(float));
         if (cast_now) {
-            cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(mw->data, param->data, n);
+            PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(mw->data, param->data, n);
         }
     } else {
         *mw = (Float){.data = (float*)param->data, .shape = {n}};
@@ -1805,7 +1803,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .vtrace_c_clip = puf_ini_get(ini, "train", "vtrace_c_clip"),
         .async = puf_ini_get(ini, "base", "async") != 0,
         .reset_every_horizon = puf_ini_get(ini, "base", "reset_every_horizon") != 0,
-        .cudagraphs = puf_ini_get(ini, "base", "cudagraphs") >= 0,
+        .cudagraphs = !PUF_HOST_KERNELS
+            && puf_ini_get(ini, "base", "cudagraphs") >= 0,
         .profile = puf_ini_get(ini, "base", "profile") != 0,
         .rank = ctx->rank,
         .world_size = ctx->world_size,
@@ -2044,7 +2043,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             agents_per_buf * sizeof(curandStatePhilox4_32_10_t));
         cudaMemset(pufferl->rng_states[i], 0,
             agents_per_buf * sizeof(curandStatePhilox4_32_10_t));
-        rng_init<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
+        PUF_LAUNCH(rng_init, grid_size(agents_per_buf), BLOCK_SIZE)(
             pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
     }
 
@@ -2567,6 +2566,12 @@ typedef struct {
     TrainResult result;
 } SweepJob;
 
+#ifdef PUF_TRAIN_CPU
+void run_sweep(Ini*, const char*) {
+    fprintf(stderr, "sweep: Protein needs cuSOLVER; not available in the CPU trainer\n");
+    exit(1);
+}
+#else
 void run_sweep(Ini* ini, const char* exe_path) {
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
@@ -2840,6 +2845,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         completed++;
     }
 }
+#endif
 
 // Sweep objective: bare names → env/<name>; keys with '/' used as-is.
 static void sweep_metric_key(Ini* ini, char* buf, size_t n) {

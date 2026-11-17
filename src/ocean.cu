@@ -13,7 +13,7 @@ void puf_normal_init(Prec* dst, float std, ulong seed, cudaStream_t stream) {
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
     curandDestroyGenerator(gen);
-    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(dst->data, buf, n);
     cudaFree(buf);
 }
 

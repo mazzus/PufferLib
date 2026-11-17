@@ -420,6 +420,48 @@ elif [ "$MODE" = "cpu" ]; then
     exit 0
 fi
 
+# No CUDA (macOS): CPU trainer backend. The same CUDA C++ trainer sources
+# compile as C++ against src/puf_cuda_cpu.h; kernels run as host loops and
+# GEMMs go to Accelerate. fp32 only (implies --float).
+if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
+    if [ "$USE_GPU_ENV" = "1" ]; then
+        echo "Error: --cu envs need CUDA; the CPU trainer supports .h envs" >&2
+        exit 1
+    fi
+    ENV_HEADER="$SRC_DIR/$ENV.h"
+    if ! grep -q 'typedef[[:space:]].*obs_t' "$ENV_HEADER" 2>/dev/null; then
+        echo "Error: $ENV_HEADER must typedef obs_t"
+        exit 1
+    fi
+    TRAIN_BIN=${OUT:-${USER_OUTPUT_NAME:-puffer}}
+    if [ -n "$DEBUG" ]; then
+        CPU_OPT=(-O0 -g)
+    else
+        CPU_OPT=(-O2 -g)
+    fi
+    echo "Compiling $ENV_HEADER -> $TRAIN_BIN (CPU trainer)..."
+    ${CXX:-clang++} -std=c++17 "${CPU_OPT[@]}" "${SIMD_FLAGS[@]}" -fveclib=Darwin_libsystem_m \
+        -Wno-narrowing -Wno-c99-designator -Wno-unreachable-code \
+        -Wno-vla-cxx-extension -Wno-unused-function -Wno-unused-variable \
+        -I. -Isrc -I$SRC_DIR -Ivendor "${INCLUDES[@]}" \
+        -DPUF_TRAIN_CPU -DPRECISION_FLOAT \
+        -DENV_HEADER=\"$ENV_HEADER\" \
+        -DENV_NAME=$ENV \
+        -DPUFFER_ENV_NAME=\"$ENV\" \
+        -DPUFFERLIB_BUILD_MAIN \
+        -DPLATFORM_DESKTOP \
+        "${EXTRA_CFLAGS[@]}" \
+        -x c++ src/pufferl.cu -x c $EXTRA_SRC -x none \
+        "${LINK_ARCHIVES[@]}" \
+        "${EXTRA_LDFLAGS[@]}" \
+        "${OMP_FLAGS[@]}" \
+        -framework Accelerate "${STANDALONE_LDFLAGS[@]}" \
+        -lm -lpthread \
+        -o "$TRAIN_BIN"
+    echo "Built: ./$TRAIN_BIN"
+    exit 0
+fi
+
 CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
 # NCCL include/lib fallback.
 # Needed when NCCL is provided by the nvidia-nccl-cu12 wheel in the active venv.
