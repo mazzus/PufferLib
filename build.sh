@@ -83,7 +83,7 @@ PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_FLAGS=(-fopenmp)
-    OMP_LIB=-lomp5
+    OMP_LIB=${OMP_LIB:--lomp5}
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
 else
@@ -441,7 +441,7 @@ fi
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
-NVCC="ccache $CUDA_HOME/bin/nvcc"
+NVCC="$(command -v ccache >/dev/null && echo ccache) $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 ARCH=${NVCC_ARCH:-native}
 
