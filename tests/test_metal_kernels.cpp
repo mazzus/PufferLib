@@ -66,9 +66,23 @@ static Prec P(float* p, int64_t a, int64_t b = 0, int64_t c = 0) {
     return {.data = p, .shape = {a, b, c}};
 }
 
+// Env action layout: A = total logit columns (sum of head sizes; continuous
+// heads are size 1), continuous if every head is size 1.
+static const int ACT_SZ[] = ACT_SIZES;
+static int act_total() { int a = 0; for (int h = 0; h < NUM_ATNS; h++) a += ACT_SZ[h]; return a; }
+static bool act_continuous() { for (int h = 0; h < NUM_ATNS; h++) if (ACT_SZ[h] != 1) return false; return true; }
+static void fill_actions(float* act, long rows) {
+    for (long i = 0; i < rows; i++)
+        for (int h = 0; h < NUM_ATNS; h++)
+            act[i * NUM_ATNS + h] = ACT_SZ[h] == 1 ? urand() : (float)((i * 7 + h * 3) % ACT_SZ[h]);
+}
+
 int main() {
     cublas_init_handle();
-    const int B = 96, T = 32, H = 40, A = 3;
+    const int B = 96, T = 32, H = 40, A = act_total();
+    const bool CONT = act_continuous();
+    printf("env %s: NUM_ATNS=%d A_total=%d %s\n", PUFFER_ENV_NAME, NUM_ATNS, A,
+        CONT ? "continuous" : "discrete");
 
     {   // mingru_gate
         Case c;
@@ -114,6 +128,7 @@ int main() {
         c.add((long)N * A, 1, 1);          // 5 mask (all ones)
         long rng_floats = (long)N * sizeof(curandStatePhilox4_32_10_t) / 4;
         c.zeros(rng_floats);               // 6 rng states
+        c.add(NUM_ATNS, -1.0f, 0.5f);      // 7 logstd (continuous only)
         int* act_sizes;
         cudaMalloc(&act_sizes, sizeof(int) * NUM_ATNS);
         int as[] = ACT_SIZES;
@@ -122,8 +137,9 @@ int main() {
         for (int i = 0; i < N; i++) curand_init(7, i, 0, &st[i]);
         diff("sample_logits (x3 steps)", c, [&](std::vector<Buf>& b) {
             for (int step = 0; step < 3; step++) {
+                Prec logstd = CONT ? P(b[7].p, 1, NUM_ATNS) : Prec{};
                 PUF_LAUNCH(sample_logits, grid_size(N), BLOCK_SIZE)(
-                    P(b[0].p, N, A + 1), Prec{}, act_sizes, b[1].p, b[2].p, b[3].p,
+                    P(b[0].p, N, A + 1), logstd, act_sizes, b[1].p, b[2].p, b[3].p,
                     b[4].p, (curandStatePhilox4_32_10_t*)b[6].p, b[5].p, A);
             }
         }, 1e-5);
@@ -161,7 +177,7 @@ int main() {
         int Nb = 64, Tb = 32, NT = Nb * Tb;
         c.add((long)NT * (A + 1), -3, 3);     // 0 dec
         float* act = c.zeros((long)NT * NUM_ATNS);  // 1 actions
-        for (int i = 0; i < NT; i++) act[i] = (float)(i % A);
+        fill_actions(act, NT);
         c.add(NT, -1.5f, -0.5f);               // 2 old logprobs
         c.add((long)NT * A, 1, 1);             // 3 mask
         c.zeros(NT); c.zeros(NT);              // 4 imp, 5 value
@@ -172,26 +188,35 @@ int main() {
         c.zeros((long)grid * LOSS_N);          // 11 partials
         c.zeros(NUM_LOSSES);                   // 12 losses
         float* ent = c.zeros(1); ent[0] = 0.01f;  // 13 ent_coef
+        c.add(NUM_ATNS, -1.0f, 0.5f);          // 14 logstd (continuous)
+        c.zeros((long)NT * NUM_ATNS);          // 15 grad_logstd (continuous)
+        c.zeros(NUM_ATNS);                     // 16 summed logstd grad
         int* act_sizes;
         cudaMalloc(&act_sizes, sizeof(int) * NUM_ATNS);
         int as[] = ACT_SIZES;
         memcpy(act_sizes, as, sizeof(as));
         diff("cache_imp + ppo_loss", c, [&](std::vector<Buf>& b) {
             Prec dec = P(b[0].p, Nb, Tb, A + 1);
+            Prec logstd = CONT ? P(b[14].p, 1, NUM_ATNS) : Prec{};
             PUF_LAUNCH(cache_imp_and_v, grid_size(NT), BLOCK_SIZE)(dec, b[1].p, b[2].p,
-                b[3].p, Prec{}, act_sizes, b[4].p, b[5].p, b[6].p, b[7].p);
+                b[3].p, logstd, act_sizes, b[4].p, b[5].p, b[6].p, b[7].p);
             PPOKernelArgs ka = {
-                .grad_logits = b[6].p, .grad_logstd = NULL, .grad_values_pred = b[7].p,
-                .logits = b[0].p, .logstd = NULL, .values_pred = b[0].p + A,
+                .grad_logits = b[6].p, .grad_logstd = CONT ? b[15].p : NULL,
+                .grad_values_pred = b[7].p,
+                .logits = b[0].p, .logstd = CONT ? b[14].p : NULL, .values_pred = b[0].p + A,
                 .act_sizes = act_sizes, .action_mask = b[3].p, .num_atns = NUM_ATNS,
                 .clip_coef = 0.2f, .vf_clip_coef = 0.5f, .vf_coef = 0.5f,
                 .ent_coef = b[13].p, .T_seq = Tb, .A_total = A, .N = Nb,
-                .is_continuous = false,
+                .is_continuous = CONT,
             };
             PPOGraphArgs ga = {.imp = b[4].p, .actions = b[1].p, .old_logprobs = b[2].p,
                 .advantages = b[8].p, .values = b[9].p, .returns = b[10].p};
             PUF_LAUNCH(ppo_loss_compute, grid, PPO_THREADS)(b[11].p, ka, ga);
             PUF_LAUNCH(ppo_loss_reduce, 1, LOSS_N)(b[12].p, b[11].p, grid);
+            if (CONT) {  // decoder backward: logstd grad summed over rows
+                PUF_LAUNCH(sum_rows_to_precision_kernel, grid_size(NUM_ATNS), BLOCK_SIZE)(
+                    b[16].p, b[15].p, NT, NUM_ATNS);
+            }
         }, 1e-5);
     }
     {   // small elementwise kernels

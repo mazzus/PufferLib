@@ -111,8 +111,10 @@ static void load_library() {
     NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path]
         encoding:NSUTF8StringEncoding error:nil];
     if (!src) {
-        fprintf(stderr, "PUF_TRAIN_METAL: no kernel library at %s; all kernels run on CPU\n", path);
-        return;
+        // Fatal: silently running every kernel on the CPU would hide a broken install.
+        fprintf(stderr, "PUF_TRAIN_METAL: kernel library not found at %s (run from the repo "
+            "root or set PUF_METAL_KERNELS)\n", path);
+        abort();
     }
     MTLCompileOptions* opts = [MTLCompileOptions new];
     if (g_macros) opts.preprocessorMacros = g_macros;
@@ -185,24 +187,30 @@ extern "C" void* puf_metal_alloc(size_t bytes) {
 // Bump allocator: frees are ignored (the trainer allocates up front).
 extern "C" void puf_metal_free(void*) {}
 
-static const Chunk* find_chunk(const void* p) {
+// Returns the chunk by value: another thread's puf_metal_alloc may grow
+// g_chunks (reallocating it) once the lock is released.
+static bool find_chunk(const void* p, Chunk* out) {
     const char* q = (const char*)p;
     std::lock_guard<std::mutex> g(g_mu);
     for (const Chunk& c : g_chunks) {
-        if (q >= c.base && q < c.base + c.cap) return &c;
+        if (q >= c.base && q < c.base + c.cap) {
+            *out = c;
+            return true;
+        }
     }
-    return nullptr;
+    return false;
 }
 
 extern "C" int puf_metal_owns(const void* p) {
-    return p != nullptr && find_chunk(p) != nullptr;
+    Chunk c;
+    return p != nullptr && find_chunk(p, &c);
 }
 
 extern "C" uint64_t puf_metal_gpu_address(const void* p) {
     if (!p) return 0;
-    const Chunk* c = find_chunk(p);
-    if (!c) puf_metal_fatal("pointer is not in the Metal arena");
-    return c->buf.gpuAddress + (uint64_t)((const char*)p - c->base);
+    Chunk c;
+    if (!find_chunk(p, &c)) puf_metal_fatal("pointer is not in the Metal arena");
+    return c.buf.gpuAddress + (uint64_t)((const char*)p - c.base);
 }
 
 static void commit_nowait(ThreadCtx* c) {
@@ -267,23 +275,22 @@ static id<MTLBlitCommandEncoder> blit_encoder(ThreadCtx* c) {
 
 extern "C" void puf_metal_copy(void* dst, const void* src, size_t bytes) {
     if (!bytes) return;
-    const Chunk* cd = find_chunk(dst);
-    const Chunk* cs = find_chunk(src);
-    if (!cd || !cs) puf_metal_fatal("puf_metal_copy outside arena");
+    Chunk cd, cs;
+    if (!find_chunk(dst, &cd) || !find_chunk(src, &cs)) puf_metal_fatal("puf_metal_copy outside arena");
     ThreadCtx* c = ctx();
-    [blit_encoder(c) copyFromBuffer:cs->buf sourceOffset:(const char*)src - cs->base
-        toBuffer:cd->buf destinationOffset:(char*)dst - cd->base size:bytes];
+    [blit_encoder(c) copyFromBuffer:cs.buf sourceOffset:(const char*)src - cs.base
+        toBuffer:cd.buf destinationOffset:(char*)dst - cd.base size:bytes];
     g_blit_n++;
     count_command(c);
 }
 
 extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
     if (!bytes) return;
-    const Chunk* cd = find_chunk(dst);
-    if (!cd) puf_metal_fatal("puf_metal_fill outside arena");
+    Chunk cd;
+    if (!find_chunk(dst, &cd)) puf_metal_fatal("puf_metal_fill outside arena");
     ThreadCtx* c = ctx();
-    size_t off = (char*)dst - cd->base;
-    [blit_encoder(c) fillBuffer:cd->buf range:NSMakeRange(off, bytes) value:(uint8_t)value];
+    size_t off = (char*)dst - cd.base;
+    [blit_encoder(c) fillBuffer:cd.buf range:NSMakeRange(off, bytes) value:(uint8_t)value];
     g_blit_n++;
     count_command(c);
 }
@@ -293,10 +300,10 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
         float alpha, const float* A, int lda, const float* B, int ldb,
         float beta, float* C, int ldc) {
     if (m <= 0 || n <= 0) return;
-    const Chunk* ca = find_chunk(A);
-    const Chunk* cbk = find_chunk(B);
-    const Chunk* cc = find_chunk(C);
-    if (!ca || !cbk || !cc) puf_metal_fatal("sgemm operand outside arena");
+    Chunk ca, cbk, cc;
+    if (!find_chunk(A, &ca) || !find_chunk(B, &cbk) || !find_chunk(C, &cc)) {
+        puf_metal_fatal("sgemm operand outside arena");
+    }
     // col-major C(m,n) = op(A) op(B)  <=>  row-major Cr(n,m) = op(B)^T op(A)^T
     if ((long)m * n * k <= g_small_gemm && puf_metal_has_kernel("gemm_tile")) {
         struct {
@@ -315,11 +322,11 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     // Left = B as row-major Br (colsB x rowsB); op(B)^T = tb ? Br^T : Br.
     int rowsB = tb ? n : k, colsB = tb ? k : n;
     int rowsA = ta ? k : m, colsA = ta ? m : k;
-    MPSMatrix* ml = cached_matrix(c, cbk->buf, (const char*)B - cbk->base,
+    MPSMatrix* ml = cached_matrix(c, cbk.buf, (const char*)B - cbk.base,
         colsB, rowsB, (size_t)ldb * 4);
-    MPSMatrix* mr = cached_matrix(c, ca->buf, (const char*)A - ca->base,
+    MPSMatrix* mr = cached_matrix(c, ca.buf, (const char*)A - ca.base,
         colsA, rowsA, (size_t)lda * 4);
-    MPSMatrix* mc = cached_matrix(c, cc->buf, (const char*)C - cc->base,
+    MPSMatrix* mc = cached_matrix(c, cc.buf, (const char*)C - cc.base,
         n, m, (size_t)ldc * 4);
     char key[128];
     snprintf(key, sizeof(key), "%d%d %d %d %d %a %a", tb, ta, n, m, k, alpha, beta);

@@ -110,8 +110,11 @@ int main(int argc, char** argv) {
             term[i] = (lcg(&s) % 50 == 0) ? 1.0f : 0.0f;
             float lpi = 0.0f;
             for (int h = 0; h < NUM_ATNS; h++) {
-                act[i * NUM_ATNS + h] = (float)(lcg(&s) % (uint32_t)act_sizes[h]);
-                lpi += logf(1.0f / act_sizes[h]) + 0.1f * lcg_unit(&s);
+                // Continuous heads (size 1) get real-valued actions
+                act[i * NUM_ATNS + h] = act_sizes[h] == 1 ? lcg_unit(&s)
+                    : (float)(lcg(&s) % (uint32_t)act_sizes[h]);
+                lpi += act_sizes[h] == 1 ? -1.0f + 0.1f * lcg_unit(&s)
+                    : logf(1.0f / act_sizes[h]) + 0.1f * lcg_unit(&s);
             }
             lp[i] = lpi;
         }
