@@ -453,6 +453,15 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
         BACKEND_NAME="CPU trainer + Metal"
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN ($BACKEND_NAME)..."
+    # C sources (e.g. impulse_wars_api.c) compile as C, not with -std=c++17
+    EXTRA_OBJS=()
+    for src in $EXTRA_SRC; do
+        obj="build/$(basename "${src%.c}")_cpu_trainer.o"
+        mkdir -p build
+        ${CC:-clang} -std=c11 "${CPU_OPT[@]}" -w -I. -Isrc -I$SRC_DIR -Ivendor \
+            "${INCLUDES[@]}" -DPLATFORM_DESKTOP "${EXTRA_CFLAGS[@]}" -c "$src" -o "$obj"
+        EXTRA_OBJS+=("$obj")
+    done
     ${CXX:-clang++} -std=c++17 "${CPU_OPT[@]}" "${SIMD_FLAGS[@]}" -fveclib=Darwin_libsystem_m \
         -Wno-narrowing -Wno-c99-designator -Wno-unreachable-code \
         -Wno-vla-cxx-extension -Wno-unused-function -Wno-unused-variable \
@@ -464,7 +473,7 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
         -DPUFFERLIB_BUILD_MAIN \
         -DPLATFORM_DESKTOP \
         "${EXTRA_CFLAGS[@]}" \
-        -x c++ src/pufferl.cu -x c $EXTRA_SRC "${METAL_SRC[@]}" -x none \
+        -x c++ src/pufferl.cu "${METAL_SRC[@]}" -x none "${EXTRA_OBJS[@]}" \
         "${LINK_ARCHIVES[@]}" \
         "${EXTRA_LDFLAGS[@]}" \
         "${OMP_FLAGS[@]}" \
