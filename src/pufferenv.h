@@ -18,6 +18,14 @@ static void puf_web_vsync(void) {
 }
 #endif
 
+// Pointer-to-VLA local from a cast (C idiom). clang++ treats each VLA type
+// instance as distinct, so C++ uses auto; C uses __typeof__.
+#ifdef __cplusplus
+#define PUF_VLA_PTR(name, cast_expr) auto name = cast_expr
+#else
+#define PUF_VLA_PTR(name, cast_expr) __typeof__(cast_expr) name = cast_expr
+#endif
+
 typedef struct Env Env;
 typedef struct Log Log;
 

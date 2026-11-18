@@ -33,7 +33,7 @@ else
     if [ "${METAL:-0}" = "1" ]; then
         SUFFIX="_metal"
         METAL_ARGS=(-DPUF_TRAIN_METAL -x objective-c++ -fobjc-arc src/puf_metal.mm
-            -framework Metal -framework MetalPerformanceShaders -framework Foundation)
+            -framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore)
     fi
     ${CXX:-clang++} -std=c++17 -O2 -g -w -Wno-narrowing "${COMMON[@]}" \
         -DPUF_TRAIN_CPU -fveclib=Darwin_libsystem_m -Iraylib-5.5_macos/include -DPLATFORM_DESKTOP \

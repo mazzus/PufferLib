@@ -739,3 +739,74 @@ kernel void puff_advantage(constant Advantage& a [[buffer(0)]], KERNEL_IDX) {
         }
     }
 }
+
+// ---- small GEMM (replaces MPS where its ~75us host encode cost dominates) ---
+// Row-major C(M,N) = alpha * L' @ R' + beta * C with L' = transL ? L^T : L and
+// R' = transR ? R^T : R (puf_metal_sgemm maps cuBLAS column-major onto this).
+// 32x32 C tile per threadgroup, 4 simdgroups x (2x2 8x8 fragments), K step 16.
+#include <metal_simdgroup_matrix>
+struct GemmArgs {
+    device float* L; device float* R; device float* C;
+    int M, N, K, ldl, ldr, ldc, transL, transR;
+    float alpha, beta;
+};
+kernel void gemm_tile(constant GemmArgs& a [[buffer(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        uint sid [[simdgroup_index_in_threadgroup]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float As[32 * 16];
+    threadgroup float Bs[16 * 32];
+    threadgroup float Cs[32 * 32];
+    int row0 = tg.y * 32, col0 = tg.x * 32;
+    int sg_r = (sid / 2) * 16, sg_c = (sid % 2) * 16;
+    simdgroup_float8x8 acc[2][2];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_float8x8(0.0f);
+    for (int k0 = 0; k0 < a.K; k0 += 16) {
+        for (int e = tid; e < 512; e += 128) {
+            int r = e / 16, kk = e % 16;
+            int gi = row0 + r, gk = k0 + kk;
+            float v = 0.0f;
+            if (gi < a.M && gk < a.K) {
+                v = a.transL ? a.L[(long)gk * a.ldl + gi] : a.L[(long)gi * a.ldl + gk];
+            }
+            As[r * 16 + kk] = v;
+        }
+        for (int e = tid; e < 512; e += 128) {
+            int kk = e / 32, c = e % 32;
+            int gk = k0 + kk, gj = col0 + c;
+            float v = 0.0f;
+            if (gk < a.K && gj < a.N) {
+                v = a.transR ? a.R[(long)gj * a.ldr + gk] : a.R[(long)gk * a.ldr + gj];
+            }
+            Bs[kk * 32 + c] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 16; kk += 8) {
+            simdgroup_float8x8 af[2], bf[2];
+            for (int i = 0; i < 2; i++)
+                simdgroup_load(af[i], &As[(sg_r + i * 8) * 16 + kk], 16);
+            for (int j = 0; j < 2; j++)
+                simdgroup_load(bf[j], &Bs[kk * 32 + sg_c + j * 8], 32);
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            simdgroup_store(acc[i][j], &Cs[(sg_r + i * 8) * 32 + sg_c + j * 8], 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < 1024; e += 128) {
+        int r = e / 32, c = e % 32;
+        int gi = row0 + r, gj = col0 + c;
+        if (gi < a.M && gj < a.N) {
+            long ci = (long)gi * a.ldc + gj;
+            float v = a.alpha * Cs[e];
+            if (a.beta != 0.0f) v += a.beta * a.C[ci];
+            a.C[ci] = v;
+        }
+    }
+}

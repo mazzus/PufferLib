@@ -35,6 +35,9 @@ void puf_metal_flush(void);
 // GPU blit copy / byte fill within the arena (recorded, not waited for).
 void puf_metal_copy(void* dst, const void* src, size_t bytes);
 void puf_metal_fill(void* dst, int value, size_t bytes);
+// Small host->device copy recorded in stream order (staged in the arena), no
+// flush. Returns 0 if the copy is too large; the caller then flushes + memcpy.
+int puf_metal_upload(void* dst, const void* src, size_t bytes);
 
 // Column-major GEMM with cublasGemmEx semantics, fp32, all operands in the
 // arena: C(m,n) = alpha * op(A) @ op(B) + beta * C.
@@ -52,6 +55,8 @@ void puf_metal_dispatch(const char* name, uint32_t grid_x, uint32_t grid_y,
 
 // Counters for profiling (process-wide).
 void puf_metal_stats(long* flushes, long* gemms, long* dispatches, long* blits);
+// Summed GPU execution time of flushed command buffers, and host time spent waiting.
+void puf_metal_times(double* gpu_s, double* wait_s);
 
 #ifdef __cplusplus
 }
