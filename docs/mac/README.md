@@ -31,8 +31,8 @@ CUDA builds are unaffected.
   supported yet.
 - **Correctness:** checked against CUDA. Forward pass and single-minibatch
   losses match to float precision for discrete, multi-head and continuous
-  action spaces. Full training runs reach the same scores (breakout,
-  pacman).
+  action spaces. Full training runs reach the same scores (breakout, pacman, tetris within
+  CUDA seed spread).
 - **Not available:** the Protein hyperparameter `sweep` (needs cuSOLVER),
   multi-GPU, bf16.
 

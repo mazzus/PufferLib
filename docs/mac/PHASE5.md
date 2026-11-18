@@ -129,3 +129,18 @@ noise).
 
   The trainer-eval columns agree within episode noise. The `--cpu` binary
   uses its own eval loop.
+
+## Full-length learning runs
+
+Default configs, full `total_timesteps`, Metal backend with default settings
+(async=1). CUDA runs on an RTX 5090.
+
+| env | Mac Metal (score / perf) | CUDA (score / perf) |
+|---|---|---|
+| pacman (205M steps) | 193.1 / 0.805 | 187.2 / 0.780 (bf16) |
+| tetris (1.92B steps) | 14067 / 0.094 | fp32: 25067 / 0.167, 15551 / 0.104, 13367 / 0.089 (seeds 73, 1, 2); bf16: 29980 / 0.200 |
+
+tetris varies widely from seed to seed: three CUDA fp32 seeds span
+13.4K–25.1K, and the Mac run falls inside that range. Wall time: pacman
+about 11 min, tetris 3 h 18 min (170K SPS) on the Mac, against 23 min for
+CUDA fp32.
