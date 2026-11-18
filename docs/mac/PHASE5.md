@@ -107,3 +107,25 @@ noise).
 - MinGRU row-scan kernels (cooperative) are never chosen with host kernels;
   long-horizon configs (maze, mazing_contest, terraform) aborted before this fix.
 - Arena allocation failures report the requested size.
+
+## Correctness beyond the reference configs
+
+- **Action spaces:** `tests/test_metal_kernels.sh ENV` passes for breakout
+  (1 discrete head), drone (4 continuous heads) and click (3 discrete
+  heads, 12 logits). Oracle vs CUDA fp32, one minibatch (max relative),
+  CPU / Metal:
+
+| env | forward (decoder) | losses |
+|---|---|---|
+| drone (continuous) | 4.2e-7 / 3.4e-7 | 1.2e-8 / 1.2e-8 |
+| click (multi-head) | 5.8e-7 / 4.7e-7 | 1.6e-8 / 3.1e-8 |
+
+- **Checkpoints** (breakout, flat fp32 format) load in both directions:
+
+| checkpoint | Mac Metal eval | CUDA fp32 eval | CUDA bf16 eval | `--cpu` binary |
+|---|---|---|---|---|
+| trained on Mac (Metal) | 760 / 0.88 | 752 / 0.87 | 781 / 0.90 | 849 / 0.98 |
+| trained on CUDA (bf16) | 817 / 0.95 | — | 810 / 0.94 | 856 / 0.99 |
+
+  The trainer-eval columns agree within episode noise. The `--cpu` binary
+  uses its own eval loop.

@@ -66,3 +66,24 @@ gains. What's left:
   storage path (`precision_t`) on Metal.
 - **Fusion:** fold the MinGRU gate into the GEMM epilogue, and batch Muon's
   per-layer Newton–Schulz GEMMs (layers share shapes) to cut dispatches.
+
+## Update: async comparison and fresh numbers
+
+After the `find_chunk` fix (`tests/bench_train_sps.sh`, breakout 3
+repeats, others 2):
+
+| config | async=0 | async=1 (default) |
+|---|---|---|
+| breakout | 2.13M | **2.29M** (repeats within 0.3%) |
+| pacman | 300K | **321K** |
+| tetris | 164K | **190K** |
+
+async=1 is faster on every config, so it stays the default.
+
+These are much higher and much steadier than the earlier end-to-end
+numbers in this document (breakout 1.1–1.3M, pacman ~265K, tetris
+~164K). No change in between explains a jump that size. The earlier runs
+most likely shared the machine with background load (builds, indexing of
+build outputs), so treat them as pessimistic. tetris now slightly exceeds
+the rough fp32 "ceiling" estimate (~180K), which shows that estimate was
+conservative.
