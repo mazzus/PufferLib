@@ -243,7 +243,8 @@ int main() {
     {   // GEMM wrappers on the Metal path (gemm_tile below the size threshold,
         // MPS above) vs host cblas on the same inputs.
         int shapes[][3] = {{1, 1, 1}, {3, 5, 7}, {64, 17, 33}, {130, 96, 258},
-            {256, 256, 256}, {300, 768, 256}, {2048, 768, 256}};
+            {256, 256, 256}, {300, 768, 256}, {2048, 768, 256},
+            {96, 32, 8192}, {256, 96, 3000}};  // long K: split-K + K loop on MPP
         for (auto& sh : shapes) {
             int M = sh[0], N = sh[1], K = sh[2];
             for (int form = 0; form < 3; form++) {
@@ -306,8 +307,8 @@ int main() {
             md = fmax(md, fabs(acc - G[i * R + j]) / fmax(1.0, fabs(acc)));
         }
         failures += md >= 1e-5;
-        printf("%s gemm forms x shapes (tile + MPS), muon gram rel %.3e\n",
-            md < 1e-5 ? "ok  " : "FAIL", md);
+        printf("%s gemm forms x shapes (%s), muon gram rel %.3e\n",
+            md < 1e-5 ? "ok  " : "FAIL", puf_metal_has_mpp_gemm() ? "MPP" : "MPS", md);
     }
     printf(failures ? "FAILED: %d\n" : "OK\n", failures);
     return failures != 0;

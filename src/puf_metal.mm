@@ -30,6 +30,7 @@ struct Chunk {
 
 static id<MTLDevice> g_dev = nil;
 static id<MTLLibrary> g_lib = nil;
+static id<MTLLibrary> g_gemm_lib = nil;  // src/puf_gemm.metal (MPP); nil = MPS GEMMs
 static std::mutex g_mu;
 static std::vector<Chunk> g_chunks;           // guarded by g_mu
 static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResources
@@ -55,6 +56,8 @@ struct ThreadCtx {
     // so each thread caches its own (rollout workers encode concurrently).
     std::unordered_map<std::string, MPSMatrixMultiplication*> gemms;
     std::unordered_map<std::string, MPSMatrix*> mats;
+    void* gemm_ws = nullptr;          // split-K fp32 partials (arena)
+    size_t gemm_ws_bytes = 0;
 };
 
 // MPSMatrix wrappers for (buffer, offset, shape, rowBytes), cached per thread:
@@ -89,6 +92,10 @@ static ThreadCtx* ctx() {
 // while the host keeps encoding. Same-queue command buffers run in order.
 static int g_commit_every = 0;
 static long g_small_gemm = 0;  // M*N*K at or below which gemm_tile replaces MPS
+// MPP GEMM tuning (env PUF_GEMM_SPLIT_TARGET / _MIN_KC / _KLOOP_MIN)
+static long g_split_target = 320;  // threadgroups to aim for (~8 per core, 40 cores)
+static int g_split_min_kc = 512;   // minimum K per split
+static int g_kloop_min = 1024;     // K per threadgroup at which the barrier K loop is used
 static void commit_nowait(ThreadCtx* c);
 static void count_command(ThreadCtx* c) {
     if (++c->pending >= g_commit_every) commit_nowait(c);
@@ -136,6 +143,39 @@ static void load_library() {
     }
 }
 
+// MPP GEMM library (MSL 4, macOS 26+). Optional: if it is missing or fails
+// to compile, fp32 GEMMs use MPS and bf16 GEMMs are unavailable.
+// PUF_METAL_GEMM=mps forces MPS.
+static void load_gemm_library() {
+    const char* force = getenv("PUF_METAL_GEMM");
+    if (force && strcmp(force, "mps") == 0) return;
+    const char* path = getenv("PUF_METAL_GEMM_KERNELS");
+    if (!path) path = "src/puf_gemm.metal";
+    NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path]
+        encoding:NSUTF8StringEncoding error:nil];
+    if (!src) {
+        fprintf(stderr, "PUF_TRAIN_METAL: %s not found; using MPS GEMMs\n", path);
+        return;
+    }
+    if (@available(macOS 26.0, *)) {
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        opts.languageVersion = MTLLanguageVersion4_0;
+        NSError* err = nil;
+        g_gemm_lib = [g_dev newLibraryWithSource:src options:opts error:&err];
+        if (!g_gemm_lib) {
+            fprintf(stderr, "PUF_TRAIN_METAL: %s failed to compile; using MPS GEMMs\n%s\n",
+                path, [[err description] UTF8String]);
+        }
+    } else {
+        fprintf(stderr, "PUF_TRAIN_METAL: MPP GEMMs need macOS 26; using MPS GEMMs\n");
+    }
+}
+
+extern "C" int puf_metal_has_mpp_gemm(void) {
+    puf_metal_init();
+    return g_gemm_lib != nil;
+}
+
 extern "C" void puf_metal_define(const char* name, long value) {
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
@@ -152,8 +192,12 @@ extern "C" void puf_metal_init(void) {
         g_commit_every = ce ? atoi(ce) : 16;
         const char* sg = getenv("PUF_METAL_SMALL_GEMM");
         g_small_gemm = sg ? atol(sg) : 0;  // gemm_tile measured slower than MPS on the GPU
+        if (const char* v = getenv("PUF_GEMM_SPLIT_TARGET")) g_split_target = atol(v);
+        if (const char* v = getenv("PUF_GEMM_MIN_KC")) g_split_min_kc = atoi(v);
+        if (const char* v = getenv("PUF_GEMM_KLOOP_MIN")) g_kloop_min = atoi(v);
         if (g_commit_every < 1) g_commit_every = 1;
         load_library();
+        load_gemm_library();
     });
 }
 
@@ -295,6 +339,79 @@ extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
     count_command(c);
 }
 
+// MPP GEMM (src/puf_gemm.metal). Takes cuBLAS column-major arguments:
+// col-major C(m,n) = op(A) op(B) is row-major Cr(n,m) = op(B)^T op(A)^T, i.e. a
+// row-major GEMM with M=n, N=m, K=k, left=B (transposed iff tb), right=A
+// (transposed iff ta). bf16: A, B, C are bf16 (fp32 accumulation).
+// Split-K (small outputs with long K, e.g. weight gradients) writes fp32
+// partials to a per-thread workspace, then a reduce kernel applies alpha/beta.
+static bool mpp_gemm(int bf16, int ta, int tb, int m, int n, int k, float alpha,
+        const void* A, int lda, const void* B, int ldb, float beta, void* C, int ldc) {
+    if (!g_gemm_lib || k <= 0) return false;
+    const int M = n, N = m, K = k, TM = 64, TN = 32, BK = 128;
+    long tiles = (long)((N + TN - 1) / TN) * ((M + TM - 1) / TM);
+    int splits = 1;
+    if (tiles < g_split_target && K >= 2 * g_split_min_kc) {
+        long s = (g_split_target + tiles - 1) / tiles;
+        long smax = K / g_split_min_kc;
+        if (s > smax) s = smax;
+        if (s > 64) s = 64;
+        splits = (int)s;
+    }
+    int k_chunk = K;
+    if (splits > 1) {
+        k_chunk = ((K + splits - 1) / splits + BK - 1) / BK * BK;
+        splits = (K + k_chunk - 1) / k_chunk;
+    }
+    const char* lay = tb ? (ta ? "tt" : "tn") : (ta ? "nt" : "nn");
+    char name[64];
+    snprintf(name, sizeof(name), "puf_gemm_%s_%s%s%s", lay, bf16 ? "bf16" : "f32",
+        (splits > 1 && bf16) ? "_part" : "", k_chunk >= g_kloop_min ? "_k" : "");
+    void* out = C;
+    if (splits > 1) {
+        ThreadCtx* c = ctx();
+        size_t need = (size_t)splits * M * N * sizeof(float);
+        if (c->gemm_ws_bytes < need) {
+            // Bump arena: the old workspace is simply abandoned (sizes settle quickly).
+            c->gemm_ws = puf_metal_alloc(need);
+            c->gemm_ws_bytes = need;
+        }
+        out = c->gemm_ws;
+    }
+    struct {
+        uint64_t a, b, c;
+        int M, N, K, lda, ldb, ldc;
+        float alpha, beta;
+        int splits, k_chunk;
+    } args = {puf_metal_gpu_address(B), puf_metal_gpu_address(A), puf_metal_gpu_address(out),
+        M, N, K, ldb, lda, ldc, alpha, beta, splits, k_chunk};
+    puf_metal_dispatch(name, (N + TN - 1) / TN, (M + TM - 1) / TM, splits, 128, 1, 1,
+        &args, sizeof(args));
+    if (splits > 1) {
+        struct {
+            uint64_t w, c;
+            int M, N, K, lda, ldb, ldc;
+            float alpha, beta;
+            int splits, k_chunk;
+        } r = {args.c, puf_metal_gpu_address(C), M, N, K, ldb, lda, ldc, alpha, beta,
+            splits, k_chunk};
+        long mn = (long)M * N;
+        puf_metal_dispatch(bf16 ? "puf_gemm_splitk_reduce_bf16" : "puf_gemm_splitk_reduce_f32",
+            (uint32_t)((mn + 255) / 256), 1, 1, 256, 1, 1, &r, sizeof(r));
+    }
+    g_gemm_n++;
+    return true;
+}
+
+extern "C" void puf_metal_gemm_bf16(int ta, int tb, int m, int n, int k,
+        float alpha, const void* A, int lda, const void* B, int ldb,
+        float beta, void* C, int ldc) {
+    if (m <= 0 || n <= 0) return;
+    if (!mpp_gemm(1, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)) {
+        puf_metal_fatal("bf16 GEMM needs the MPP GEMM library (src/puf_gemm.metal, macOS 26+)");
+    }
+}
+
 // Column-major X (rows x cols, ld) is row-major X^T (cols x rows, rowBytes ld*4).
 extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
         float alpha, const float* A, int lda, const float* B, int ldb,
@@ -304,6 +421,7 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     if (!find_chunk(A, &ca) || !find_chunk(B, &cbk) || !find_chunk(C, &cc)) {
         puf_metal_fatal("sgemm operand outside arena");
     }
+    if (mpp_gemm(0, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)) return;
     // col-major C(m,n) = op(A) op(B)  <=>  row-major Cr(n,m) = op(B)^T op(A)^T
     if ((long)m * n * k <= g_small_gemm && puf_metal_has_kernel("gemm_tile")) {
         struct {
@@ -350,8 +468,10 @@ static id<MTLComputePipelineState> pipeline(const char* name) {
     auto it = g_pipes.find(name);
     if (it != g_pipes.end()) return it->second;
     id<MTLComputePipelineState> p = nil;
-    if (g_lib) {
-        id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+    NSString* fname = [NSString stringWithUTF8String:name];
+    id<MTLFunction> f = g_lib ? [g_lib newFunctionWithName:fname] : nil;
+    if (!f && g_gemm_lib) f = [g_gemm_lib newFunctionWithName:fname];
+    {
         if (f) {
             NSError* err = nil;
             p = [g_dev newComputePipelineStateWithFunction:f error:&err];
