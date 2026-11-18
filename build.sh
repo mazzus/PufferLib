@@ -8,7 +8,8 @@ set -e
 #   ./build.sh robot_arm             # CUDA-only; implies --cu
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
 #   ./build.sh breakout --cpu        # Play/eval binary (optimized) -> ./ENV
-#   ./build.sh breakout --metal      # macOS: CPU trainer + Metal GPU backend
+#   ./build.sh breakout              # macOS: trainer with the Metal GPU backend (default)
+#   ./build.sh breakout --no-metal   # macOS: CPU-only trainer backend
 #   ./build.sh osrs_inferno --cpu     # OSRS visual policy viewer -> ./osrs_inferno
 #   ./build.sh nethack --cpu          # NetHack TTY demo (ocean/nethack/nethack.c)
 #   ./build.sh breakout myplay --cpu # Play -> ./myplay
@@ -47,6 +48,7 @@ while [ $# -gt 0 ]; do
         --profile) MODE=profile ;;
         --cpu)   MODE=cpu ;;
         --metal) USE_METAL=1 ;;
+        --no-metal) USE_METAL=0 ;;
         *) echo "Error: unknown argument '$1'" && exit 1 ;;
     esac
     shift
@@ -444,7 +446,7 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     METAL_SRC=()
     METAL_FLAGS=()
     BACKEND_NAME="CPU trainer"
-    if [ "${USE_METAL:-0}" = "1" ]; then
+    if [ "${USE_METAL:-1}" = "1" ]; then
         METAL_FLAGS=(-DPUF_TRAIN_METAL)
         METAL_SRC=(-x objective-c++ -fobjc-arc src/puf_metal.mm)
         EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation)
