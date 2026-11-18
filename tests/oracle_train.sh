@@ -28,12 +28,19 @@ if [ "$(uname -s)" = "Linux" ]; then
         -o build/oracle_train_$ENV
 else
     OMP_PREFIX="$(brew --prefix libomp)"
+    # METAL=1: CPU trainer + Metal GPU backend (binary oracle_train_ENV_metal)
+    SUFFIX=""; METAL_ARGS=()
+    if [ "${METAL:-0}" = "1" ]; then
+        SUFFIX="_metal"
+        METAL_ARGS=(-DPUF_TRAIN_METAL -x objective-c++ -fobjc-arc src/puf_metal.mm
+            -framework Metal -framework MetalPerformanceShaders -framework Foundation)
+    fi
     ${CXX:-clang++} -std=c++17 -O2 -g -w -Wno-narrowing "${COMMON[@]}" \
         -DPUF_TRAIN_CPU -fveclib=Darwin_libsystem_m -Iraylib-5.5_macos/include -DPLATFORM_DESKTOP \
         -Xclang -fopenmp -I"$OMP_PREFIX/include" \
-        -x c++ tests/oracle_train.cu -x none raylib-5.5_macos/lib/libraylib.a \
+        -x c++ tests/oracle_train.cu "${METAL_ARGS[@]}" -x none raylib-5.5_macos/lib/libraylib.a \
         -L"$OMP_PREFIX/lib" -lomp -framework Accelerate -framework Cocoa \
         -framework IOKit -framework CoreVideo -framework OpenGL \
-        -o build/oracle_train_$ENV
+        -o build/oracle_train_$ENV$SUFFIX
 fi
-echo "Built: ./build/oracle_train_$ENV"
+echo "Built: ./build/oracle_train_$ENV${SUFFIX:-}"

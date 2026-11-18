@@ -81,6 +81,23 @@ typedef struct {
     int64_t shape[PUF_MAX_DIMS];
 } Prec;
 
+#ifdef PUF_TRAIN_METAL
+// Metal argument marshaling for tensor views: {device T* data; long shape[8];}
+template <class Tensor> static inline void puf_put_tensor(PufArgWriter& w, const Tensor& t) {
+    w.align(8);
+    puf_put(w, t.data);
+    for (int i = 0; i < PUF_MAX_DIMS; i++) {
+        long v = (long)t.shape[i];
+        puf_put(w, v);
+    }
+}
+static inline void puf_put(PufArgWriter& w, const Prec& t) { puf_put_tensor(w, t); }
+static inline void puf_put(PufArgWriter& w, const Float& t) { puf_put_tensor(w, t); }
+static inline void puf_put(PufArgWriter& w, const Int& t) { puf_put_tensor(w, t); }
+static inline void puf_put(PufArgWriter& w, const Long& t) { puf_put_tensor(w, t); }
+static inline void puf_put(PufArgWriter& w, const Byte& t) { puf_put_tensor(w, t); }
+#endif
+
 __host__ __device__ int ndim(int64_t* shape) {
     int n = 0;
     while (n < PUF_MAX_DIMS && shape[n] != 0) {
@@ -151,6 +168,7 @@ __global__ void cast(precision_t* dst,
         dst[idx] = from_float(src[idx]);
     }
 }
+PUF_METAL_PORT(cast, "cast_p_f", (precision_t* dst, float* src, int n), (dst, src, n))
 
 #ifdef PRECISION_FLOAT
 // GPU envs fix obs as bf16; float train needs an explicit widen.
@@ -187,6 +205,7 @@ __global__ void cast(precision_t* dst,
         dst[idx] = from_float((float)src[idx]);
     }
 }
+PUF_METAL_PORT(cast, "cast_p_u8", (precision_t* dst, unsigned char* src, int n), (dst, src, n))
 
 __global__ void cast(unsigned char* dst,
         precision_t* src, int n) {
@@ -195,6 +214,7 @@ __global__ void cast(unsigned char* dst,
         dst[idx] = to_float(src[idx]);
     }
 }
+PUF_METAL_PORT(cast, "cast_u8_p", (unsigned char* dst, precision_t* src, int n), (dst, src, n))
 
 // Fused rew+term cast
 __global__ void cast_rew_term(
@@ -207,6 +227,7 @@ __global__ void cast_rew_term(
         term_dst[idx] = from_float(term_src[idx]);
     }
 }
+PUF_METAL_PORT(cast_rew_term, "cast_rew_term", (precision_t* rew_dst, const float* rew_src, precision_t* term_dst, const float* term_src, int n), (rew_dst, rew_src, term_dst, term_src, n))
 
 // Allocates large buffers (params/acts/grads) in contiguous memory.
 struct AllocEntry {
@@ -696,6 +717,7 @@ __global__ void sample_logits(
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
+PUF_METAL_PORT(sample_logits, "sample_logits", (Prec dec_out, Prec logstd, int* act_sizes, float* actions, float* env_actions, precision_t* logprobs, precision_t* value_out, curandStatePhilox4_32_10_t* rng_states, precision_t* action_mask, int mask_stride), (dec_out, logstd, act_sizes, actions, env_actions, logprobs, value_out, rng_states, action_mask, mask_stride))
 
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.
@@ -722,6 +744,7 @@ __global__ void snapshot_state(Prec dst, Prec src,
     long dst_i = state_elem_idx(layer, (int)dst.shape[1], dst_start + rel, h, H);
     dst.data[dst_i] = src.data[src_i];
 }
+PUF_METAL_PORT(snapshot_state, "snapshot_state", (Prec dst, Prec src, int dst_start, int count), (dst, src, dst_start, count))
 
 // View slot of full (slots, L, A, H) as (L, A, H).
 static Prec init_slot(Prec full, int slot) {
@@ -752,6 +775,7 @@ __global__ void zero_term_state(Prec state, Float terminals,
     long i = state_elem_idx(layer, (int)state.shape[1], state_start + rel, h, H);
     state.data[i] = from_float(0.0f);
 }
+PUF_METAL_PORT(zero_term_state, "zero_term_state", (Prec state, Float terminals, int state_start, int terminal_start, int count), (state, terminals, state_start, terminal_start, count))
 
 // Select time t, then agents [start, start+count). Rank-2 has F==0 (zero-term shape);
 // stride uses max(F, 1). Out shape {count, F} keeps ndim 1 when F==0.
@@ -1413,6 +1437,7 @@ __global__ void transpose_102(precision_t* dst, const precision_t* src,
     int c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
+PUF_METAL_PORT(transpose_102, "transpose_102_p", (precision_t* dst, const precision_t* src, int A, int B, int C), (dst, src, A, B, C))
 
 #if !defined(PRECISION_FLOAT)
 __global__ void transpose_102(float* dst, const float* src, int A, int B, int C) {
@@ -1443,6 +1468,7 @@ __global__ void clamp_precision_kernel(precision_t* dst, float lo, float hi, int
         dst[idx] = from_float(fminf(fmaxf(v, lo), hi));
     }
 }
+PUF_METAL_PORT(clamp_precision_kernel, "clamp_precision_kernel", (precision_t* dst, float lo, float hi, int n), (dst, lo, hi, n))
 
 // 1-thread graph node. cudaEventElapsedTime does not timestamp in-graph events.
 __global__ void puf_stamp(unsigned long long* dst) {
