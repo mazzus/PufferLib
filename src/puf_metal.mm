@@ -169,7 +169,12 @@ extern "C" void* puf_metal_alloc(size_t bytes) {
     }
     size_t cap = n > kChunk ? n : kChunk;
     id<MTLBuffer> buf = [g_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
-    if (!buf) puf_metal_fatal("arena chunk allocation failed");
+    if (!buf) {
+        fprintf(stderr, "PUF_TRAIN_METAL: arena chunk allocation of %.2f GB failed "
+            "(maxBufferLength %.1f GB, arena so far %zu chunks)\n", cap / 1e9,
+            g_dev.maxBufferLength / 1e9, g_chunks.size());
+        abort();
+    }
     Chunk c = {buf, (char*)buf.contents, cap, n};
     g_chunks.push_back(c);
     g_res.push_back(buf);

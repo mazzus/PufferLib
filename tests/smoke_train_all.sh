@@ -5,6 +5,7 @@
 #   ./tests/smoke_train_all.sh [SECONDS_EACH]
 SECS=${1:-45}
 for bin in build/envs/puffer_*; do
+    [ -f "$bin" ] && [ -x "$bin" ] || continue  # skip .dSYM bundles
     env=${bin#build/envs/puffer_}
     log=build/envs/smoke_$env.log
     perl -e 'alarm shift; exec @ARGV' "$SECS" "$bin" train > "$log" 2>&1

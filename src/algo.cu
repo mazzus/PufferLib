@@ -1007,8 +1007,8 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.terminals_ptr = terminals.data;
         if (PUF_HOST_MINGRU) {
             mingru_scan_forward_host(scan);
-        } else if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_forward_row, grid, block, 0, stream)(scan);
@@ -1036,8 +1036,8 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
         PrefixScan& scan = a->scan_bufs[i];
         if (PUF_HOST_MINGRU) {
             mingru_scan_backward_host(scan, grad.data, a->grad_next_state.data);
-        } else if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_backward_row, grid, block, 0, stream)(
