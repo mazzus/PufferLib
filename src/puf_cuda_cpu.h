@@ -224,6 +224,9 @@ static inline cudaError_t cudaMemcpy(void* d, const void* s, size_t n, cudaMemcp
         puf_metal_copy(d, s, n);
         return cudaSuccess;
     }
+    if (puf_metal_owns(d) && puf_metal_upload(d, s, n)) {
+        return cudaSuccess;
+    }
     puf_metal_flush();
 #endif
     memmove(d, s, n);
@@ -328,6 +331,9 @@ static inline void puf_prof_dump() {
     long fl, gm, dp, bl;
     puf_metal_stats(&fl, &gm, &dp, &bl);
     fprintf(stderr, "metal: flushes=%ld gemms=%ld dispatches=%ld blits=%ld\n", fl, gm, dp, bl);
+    double gpu_s, wait_s;
+    puf_metal_times(&gpu_s, &wait_s);
+    fprintf(stderr, "metal: gpu busy %.2fs (summed over threads), host wait %.2fs\n", gpu_s, wait_s);
 #endif
     for (int i = 0; i < puf_prof_n && i < 40; i++) {
         PufProfEntry* e = &puf_prof_tab[i];
@@ -403,6 +409,11 @@ template <uint64_t H>
 static inline bool puf_metal_try(PufKernelId<H>, const PufLaunchCfg&, ...) {
     return false;
 }
+// Host-emulated kernels that only touch memory the GPU never uses can run
+// without flushing pending GPU work (PUF_HOST_NOFLUSH next to the kernel).
+template <uint64_t H> static inline bool puf_host_noflush(PufKernelId<H>) { return false; }
+#define PUF_HOST_NOFLUSH(kernel) \
+    static inline bool puf_host_noflush(PufKernelId<puf_hash(#kernel)>) { return true; }
 
 struct PufArgWriter {
     alignas(16) unsigned char buf[2048];
@@ -510,7 +521,9 @@ template <uint64_t H, class F> struct PufLaunch {
             return;
         }
 #endif
-        PUF_METAL_FLUSH();
+        if (!puf_host_noflush(PufKernelId<H>{})) {
+            PUF_METAL_FLUSH();
+        }
         if (prof) t0 = puf_cpu_now_s();
         launch(a...);
         if (prof) {

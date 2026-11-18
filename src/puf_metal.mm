@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <atomic>
 #include <mutex>
@@ -35,6 +36,8 @@ static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResour
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipes;
 static NSMutableDictionary* g_macros = nil;
 static std::atomic<long> g_flushes{0}, g_gemm_n{0}, g_dispatch_n{0}, g_blit_n{0};
+static std::mutex g_time_mu;
+static double g_gpu_s = 0, g_wait_s = 0;  // guarded by g_time_mu
 
 static const size_t kChunk = (size_t)1 << 30;
 
@@ -42,12 +45,32 @@ static const size_t kChunk = (size_t)1 << 30;
 struct ThreadCtx {
     id<MTLCommandQueue> queue = nil;
     id<MTLCommandBuffer> cb = nil;
+    id<MTLCommandBuffer> last = nil;  // last committed, not yet waited for
+    int pending = 0;                  // commands recorded into cb
+    char* staging = nullptr;          // host->device upload ring (arena)
+    size_t staging_off = 0;
     id<MTLComputeCommandEncoder> compute = nil;
     id<MTLBlitCommandEncoder> blit = nil;
     // MPS kernel objects are not safe to encode from several threads at once,
     // so each thread caches its own (rollout workers encode concurrently).
     std::unordered_map<std::string, MPSMatrixMultiplication*> gemms;
+    std::unordered_map<std::string, MPSMatrix*> mats;
 };
+
+// MPSMatrix wrappers for (buffer, offset, shape, rowBytes), cached per thread:
+// the trainer reuses the same arena views every step.
+static MPSMatrix* cached_matrix(ThreadCtx* c, id<MTLBuffer> buf, size_t off,
+        int rows, int cols, size_t row_bytes) {
+    char key[96];
+    snprintf(key, sizeof(key), "%p %zu %d %d %zu", (__bridge void*)buf, off, rows, cols, row_bytes);
+    auto it = c->mats.find(key);
+    if (it != c->mats.end()) return it->second;
+    MPSMatrixDescriptor* d = [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+        columns:cols rowBytes:row_bytes dataType:MPSDataTypeFloat32];
+    MPSMatrix* m = [[MPSMatrix alloc] initWithBuffer:buf offset:off descriptor:d];
+    c->mats[key] = m;
+    return m;
+}
 static thread_local ThreadCtx* tl_ctx = nullptr;
 
 static ThreadCtx* ctx() {
@@ -60,6 +83,15 @@ static ThreadCtx* ctx() {
         tl_ctx->cb = [tl_ctx->queue commandBufferWithUnretainedReferences];
     }
     return tl_ctx;
+}
+
+// Commit the current command buffer without waiting, so the GPU executes it
+// while the host keeps encoding. Same-queue command buffers run in order.
+static int g_commit_every = 0;
+static long g_small_gemm = 0;  // M*N*K at or below which gemm_tile replaces MPS
+static void commit_nowait(ThreadCtx* c);
+static void count_command(ThreadCtx* c) {
+    if (++c->pending >= g_commit_every) commit_nowait(c);
 }
 
 static void end_encoders(ThreadCtx* c) {
@@ -114,6 +146,11 @@ extern "C" void puf_metal_init(void) {
     std::call_once(once, [] {
         g_dev = MTLCreateSystemDefaultDevice();
         if (!g_dev) puf_metal_fatal("no Metal device");
+        const char* ce = getenv("PUF_METAL_COMMIT_EVERY");
+        g_commit_every = ce ? atoi(ce) : 16;
+        const char* sg = getenv("PUF_METAL_SMALL_GEMM");
+        g_small_gemm = sg ? atol(sg) : 0;  // gemm_tile measured slower than MPS on the GPU
+        if (g_commit_every < 1) g_commit_every = 1;
         load_library();
     });
 }
@@ -163,19 +200,55 @@ extern "C" uint64_t puf_metal_gpu_address(const void* p) {
     return c->buf.gpuAddress + (uint64_t)((const char*)p - c->base);
 }
 
+static void commit_nowait(ThreadCtx* c) {
+    if (!c->cb) return;
+    end_encoders(c);
+    [c->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "PUF_TRAIN_METAL: command buffer error: %s\n",
+                [[done.error description] UTF8String]);
+            abort();
+        }
+        std::lock_guard<std::mutex> g(g_time_mu);
+        g_gpu_s += done.GPUEndTime - done.GPUStartTime;
+    }];
+    [c->cb commit];
+    c->last = c->cb;
+    c->cb = nil;
+    c->pending = 0;
+}
+
 extern "C" void puf_metal_flush(void) {
     ThreadCtx* c = tl_ctx;
-    if (!c || !c->cb) return;
-    end_encoders(c);
-    [c->cb commit];
-    [c->cb waitUntilCompleted];
-    if (c->cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "PUF_TRAIN_METAL: command buffer error: %s\n",
-            [[c->cb.error description] UTF8String]);
-        abort();
+    if (!c || (!c->cb && !c->last)) return;
+    commit_nowait(c);
+    CFTimeInterval w0 = CACurrentMediaTime();
+    [c->last waitUntilCompleted];
+    c->last = nil;
+    {
+        std::lock_guard<std::mutex> g(g_time_mu);
+        g_wait_s += CACurrentMediaTime() - w0;
     }
-    c->cb = nil;
     g_flushes++;
+}
+
+// Small host->device copy without a flush: stage the bytes in a per-thread
+// arena ring and record a GPU blit. Returns 0 if too large.
+extern "C" int puf_metal_upload(void* dst, const void* src, size_t bytes) {
+    const size_t ring = (size_t)4 << 20;
+    if (bytes > ring / 4) return 0;
+    ThreadCtx* c = ctx();
+    if (!c->staging) c->staging = (char*)puf_metal_alloc(ring);
+    size_t off = (c->staging_off + 255) & ~(size_t)255;
+    if (off + bytes > ring) {
+        puf_metal_flush();  // earlier staged blits must be done before reuse
+        c = ctx();
+        off = 0;
+    }
+    memcpy(c->staging + off, src, bytes);
+    c->staging_off = off + bytes;
+    puf_metal_copy(dst, c->staging + off, bytes);
+    return 1;
 }
 
 static id<MTLBlitCommandEncoder> blit_encoder(ThreadCtx* c) {
@@ -196,6 +269,7 @@ extern "C" void puf_metal_copy(void* dst, const void* src, size_t bytes) {
     [blit_encoder(c) copyFromBuffer:cs->buf sourceOffset:(const char*)src - cs->base
         toBuffer:cd->buf destinationOffset:(char*)dst - cd->base size:bytes];
     g_blit_n++;
+    count_command(c);
 }
 
 extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
@@ -206,6 +280,7 @@ extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
     size_t off = (char*)dst - cd->base;
     [blit_encoder(c) fillBuffer:cd->buf range:NSMakeRange(off, bytes) value:(uint8_t)value];
     g_blit_n++;
+    count_command(c);
 }
 
 // Column-major X (rows x cols, ld) is row-major X^T (cols x rows, rowBytes ld*4).
@@ -217,24 +292,30 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     const Chunk* cbk = find_chunk(B);
     const Chunk* cc = find_chunk(C);
     if (!ca || !cbk || !cc) puf_metal_fatal("sgemm operand outside arena");
+    // col-major C(m,n) = op(A) op(B)  <=>  row-major Cr(n,m) = op(B)^T op(A)^T
+    if ((long)m * n * k <= g_small_gemm && puf_metal_has_kernel("gemm_tile")) {
+        struct {
+            uint64_t L, R, C;
+            int M, N, K, ldl, ldr, ldc, transL, transR;
+            float alpha, beta;
+        } args = {puf_metal_gpu_address(B), puf_metal_gpu_address(A),
+            puf_metal_gpu_address(C), n, m, k, ldb, lda, ldc, tb, ta, alpha, beta};
+        puf_metal_dispatch("gemm_tile", (m + 31) / 32, (n + 31) / 32, 1, 128, 1, 1,
+            &args, sizeof(args));
+        g_gemm_n++;
+        return;
+    }
     ThreadCtx* c = ctx();
     end_encoders(c);
-    // col-major C(m,n) = op(A) op(B)  <=>  row-major Cr(n,m) = op(B)^T op(A)^T
     // Left = B as row-major Br (colsB x rowsB); op(B)^T = tb ? Br^T : Br.
     int rowsB = tb ? n : k, colsB = tb ? k : n;
     int rowsA = ta ? k : m, colsA = ta ? m : k;
-    MPSMatrixDescriptor* dl = [MPSMatrixDescriptor matrixDescriptorWithRows:colsB
-        columns:rowsB rowBytes:(size_t)ldb * 4 dataType:MPSDataTypeFloat32];
-    MPSMatrixDescriptor* dr = [MPSMatrixDescriptor matrixDescriptorWithRows:colsA
-        columns:rowsA rowBytes:(size_t)lda * 4 dataType:MPSDataTypeFloat32];
-    MPSMatrixDescriptor* dc = [MPSMatrixDescriptor matrixDescriptorWithRows:n
-        columns:m rowBytes:(size_t)ldc * 4 dataType:MPSDataTypeFloat32];
-    MPSMatrix* ml = [[MPSMatrix alloc] initWithBuffer:cbk->buf
-        offset:(const char*)B - cbk->base descriptor:dl];
-    MPSMatrix* mr = [[MPSMatrix alloc] initWithBuffer:ca->buf
-        offset:(const char*)A - ca->base descriptor:dr];
-    MPSMatrix* mc = [[MPSMatrix alloc] initWithBuffer:cc->buf
-        offset:(const char*)C - cc->base descriptor:dc];
+    MPSMatrix* ml = cached_matrix(c, cbk->buf, (const char*)B - cbk->base,
+        colsB, rowsB, (size_t)ldb * 4);
+    MPSMatrix* mr = cached_matrix(c, ca->buf, (const char*)A - ca->base,
+        colsA, rowsA, (size_t)lda * 4);
+    MPSMatrix* mc = cached_matrix(c, cc->buf, (const char*)C - cc->base,
+        n, m, (size_t)ldc * 4);
     char key[128];
     snprintf(key, sizeof(key), "%d%d %d %d %d %a %a", tb, ta, n, m, k, alpha, beta);
     MPSMatrixMultiplication* mm;
@@ -249,6 +330,7 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     }
     [mm encodeToCommandBuffer:c->cb leftMatrix:ml rightMatrix:mr resultMatrix:mc];
     g_gemm_n++;
+    count_command(c);
 }
 
 static id<MTLComputePipelineState> pipeline(const char* name) {
@@ -301,6 +383,13 @@ extern "C" void puf_metal_dispatch(const char* name, uint32_t gx, uint32_t gy,
     [c->compute dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
         threadsPerThreadgroup:MTLSizeMake(bx, by, bz)];
     g_dispatch_n++;
+    count_command(c);
+}
+
+extern "C" void puf_metal_times(double* gpu_s, double* wait_s) {
+    std::lock_guard<std::mutex> g(g_time_mu);
+    *gpu_s = g_gpu_s;
+    *wait_s = g_wait_s;
 }
 
 extern "C" void puf_metal_stats(long* flushes, long* gemms, long* dispatches, long* blits) {

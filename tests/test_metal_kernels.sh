@@ -13,7 +13,7 @@ ${CXX:-clang++} -std=c++17 -O1 -g -w -Wno-narrowing \
     -x c++ tests/test_metal_kernels.cpp -x objective-c++ -fobjc-arc src/puf_metal.mm \
     -x none raylib-5.5_macos/lib/libraylib.a \
     -L"$OMP_PREFIX/lib" -lomp -framework Accelerate -framework Metal \
-    -framework MetalPerformanceShaders -framework Foundation -framework Cocoa \
+    -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore -framework Cocoa \
     -framework IOKit -framework CoreVideo -framework OpenGL \
     -o build/test_metal_kernels
 ./build/test_metal_kernels

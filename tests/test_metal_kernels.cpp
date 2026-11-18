@@ -215,6 +215,75 @@ int main() {
             PUF_LAUNCH(clamp_precision_kernel, grid_size(n), BLOCK_SIZE)(b[10].p, -0.5f, 0.5f, n);
         }, 1e-6);
     }
+    {   // GEMM wrappers on the Metal path (gemm_tile below the size threshold,
+        // MPS above) vs host cblas on the same inputs.
+        int shapes[][3] = {{1, 1, 1}, {3, 5, 7}, {64, 17, 33}, {130, 96, 258},
+            {256, 256, 256}, {300, 768, 256}, {2048, 768, 256}};
+        for (auto& sh : shapes) {
+            int M = sh[0], N = sh[1], K = sh[2];
+            for (int form = 0; form < 3; form++) {
+                for (float beta : {0.0f, 0.5f}) {
+                    float alpha = form == 2 ? -1.25f : 0.75f;
+                    // form 0: puf_mm a(M,K) b(N,K)^T; 1: puf_mm_tn a(K,M)^T b(K,N); 2: puf_mm_nn
+                    long na = (long)M * K, nb = (long)N * K, nc = (long)M * N;
+                    float *A, *Bm, *C;
+                    cudaMalloc(&A, na * 4); cudaMalloc(&Bm, nb * 4); cudaMalloc(&C, nc * 4);
+                    for (long i = 0; i < na; i++) A[i] = urand();
+                    for (long i = 0; i < nb; i++) Bm[i] = urand();
+                    for (long i = 0; i < nc; i++) C[i] = urand();
+                    float* ref = (float*)malloc(nc * 4);
+                    memcpy(ref, C, nc * 4);
+                    Prec pa, pb, pc = P(C, M, N);
+                    if (form == 0) { pa = P(A, M, K); pb = P(Bm, N, K); }
+                    else if (form == 1) { pa = P(A, K, M); pb = P(Bm, K, N); }
+                    else { pa = P(A, M, K); pb = P(Bm, K, N); }
+                    // host reference, row-major
+                    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) {
+                        double acc = 0;
+                        for (int k = 0; k < K; k++) {
+                            float av = form == 1 ? A[(long)k * M + i] : A[(long)i * K + k];
+                            float bv = form == 0 ? Bm[(long)j * K + k] : Bm[(long)k * N + j];
+                            acc += (double)av * bv;
+                        }
+                        ref[(long)i * N + j] = alpha * acc + beta * ref[(long)i * N + j];
+                    }
+                    if (form == 0) puf_mm(&pa, &pb, &pc, 0, alpha, beta);
+                    else if (form == 1) puf_mm_tn(&pa, &pb, &pc, 0, alpha, beta);
+                    else puf_mm_nn(&pa, &pb, &pc, 0, alpha, beta);
+                    cudaDeviceSynchronize();
+                    double md = 0, mx = 1e-30;
+                    for (long i = 0; i < nc; i++) {
+                        md = fmax(md, fabs(ref[i] - C[i]));
+                        mx = fmax(mx, fabs(ref[i]));
+                    }
+                    bool ok = md / mx < 1e-5;
+                    failures += !ok;
+                    if (!ok) printf("FAIL gemm form=%d M=%d N=%d K=%d beta=%.1f rel %.3e\n",
+                        form, M, N, K, beta, md / mx);
+                    free(ref);
+                }
+            }
+        }
+        // Muon gram: same buffer as both operands
+        float* X;
+        int R = 96, Cc = 288;
+        cudaMalloc(&X, (long)R * Cc * 4);
+        for (long i = 0; i < (long)R * Cc; i++) X[i] = urand();
+        float* G;
+        cudaMalloc(&G, (long)R * R * 4);
+        Prec px = P(X, R, Cc), pg = P(G, R, R);
+        puf_mm(&px, &px, &pg, 0);
+        cudaDeviceSynchronize();
+        double md = 0;
+        for (int i = 0; i < R; i++) for (int j = 0; j < R; j++) {
+            double acc = 0;
+            for (int k = 0; k < Cc; k++) acc += (double)X[i * Cc + k] * X[j * Cc + k];
+            md = fmax(md, fabs(acc - G[i * R + j]) / fmax(1.0, fabs(acc)));
+        }
+        failures += md >= 1e-5;
+        printf("%s gemm forms x shapes (tile + MPS), muon gram rel %.3e\n",
+            md < 1e-5 ? "ok  " : "FAIL", md);
+    }
     printf(failures ? "FAILED: %d\n" : "OK\n", failures);
     return failures != 0;
 }

@@ -449,7 +449,7 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     if [ "${USE_METAL:-1}" = "1" ]; then
         METAL_FLAGS=(-DPUF_TRAIN_METAL)
         METAL_SRC=(-x objective-c++ -fobjc-arc src/puf_metal.mm)
-        EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation)
+        EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore)
         BACKEND_NAME="CPU trainer + Metal"
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN ($BACKEND_NAME)..."

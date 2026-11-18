@@ -1480,6 +1480,8 @@ __global__ void puf_stamp(unsigned long long* dst) {
     *dst = t;
 #endif
 }
+// Host timestamp at encode time; the stamps buffer is never touched by the GPU.
+PUF_HOST_NOFLUSH(puf_stamp)
 
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
