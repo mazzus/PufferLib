@@ -10,7 +10,8 @@ set -e
 #   ./build.sh breakout --cpu        # Play/eval binary (optimized) -> ./ENV
 #   ./build.sh breakout              # macOS: trainer with the Metal GPU backend (default)
 #   ./build.sh breakout --no-metal   # macOS: CPU-only trainer backend
-#   ./build.sh breakout --bf16       # macOS Metal: bf16 activations/grads (fp32 masters)
+#   ./build.sh breakout              # macOS 26+ Metal: bf16 activations/grads, fp32 masters (as CUDA)
+#   ./build.sh breakout --float      # macOS: fp32 trainer (implied by --no-metal and macOS < 26)
 #   ./build.sh osrs_inferno --cpu     # OSRS visual policy viewer -> ./osrs_inferno
 #   ./build.sh nethack --cpu          # NetHack TTY demo (ocean/nethack/nethack.c)
 #   ./build.sh breakout myplay --cpu # Play -> ./myplay
@@ -42,7 +43,7 @@ SNAKE_RAW=0
 while [ $# -gt 0 ]; do
     case $1 in
         --cu) USE_GPU_ENV=1 ;;
-        --float) PRECISION="-DPRECISION_FLOAT" ;;
+        --float) PRECISION="-DPRECISION_FLOAT"; MAC_FLOAT=1 ;;
         --no-onehot) SNAKE_RAW=1 ;;
         --debug) DEBUG=1 ;;
         --web)   MODE=web ;;
@@ -428,8 +429,10 @@ fi
 
 # No CUDA (macOS): CPU trainer backend. The same CUDA C++ trainer sources
 # compile as C++ against src/puf_cuda_cpu.h; kernels run as host loops and
-# GEMMs go to Accelerate. fp32 by default; --bf16 (Metal only) stores
-# activations/gradients in bf16 like the CUDA default.
+# GEMMs go to Accelerate. Precision follows CUDA: bf16 activations/gradients
+# with fp32 master weights by default (Metal backend, macOS 26+ for the MPP
+# GEMMs); --float builds fp32. The CPU-only backend (--no-metal) and older
+# macOS are fp32 only.
 if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     if [ "$USE_GPU_ENV" = "1" ]; then
         echo "Error: --cu envs need CUDA; the CPU trainer supports .h envs" >&2
@@ -450,19 +453,29 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     METAL_FLAGS=()
     MAC_PRECISION=(-DPRECISION_FLOAT)
     BACKEND_NAME="CPU trainer"
-    if [ "${MAC_BF16:-0}" = "1" ]; then
-        if [ "${USE_METAL:-1}" != "1" ]; then
-            echo "Error: --bf16 needs the Metal backend" >&2
-            exit 1
-        fi
+    MACOS_MAJOR=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+    if [ "${MAC_BF16:-0}" = "1" ] && [ "${MAC_FLOAT:-0}" = "1" ]; then
+        echo "Error: --bf16 and --float are exclusive" >&2
+        exit 1
+    fi
+    if [ "${MAC_BF16:-0}" = "1" ] && [ "${USE_METAL:-1}" != "1" ]; then
+        echo "Error: --bf16 needs the Metal backend" >&2
+        exit 1
+    fi
+    # Default bf16 when the Metal backend and MPP GEMMs (macOS 26+) are available
+    if [ "${MAC_FLOAT:-0}" != "1" ] && [ "${USE_METAL:-1}" = "1" ] && \
+       { [ "${MAC_BF16:-0}" = "1" ] || [ "${MACOS_MAJOR:-0}" -ge 26 ]; }; then
+        MAC_BF16=1
         MAC_PRECISION=()
+    else
+        MAC_BF16=0
     fi
     if [ "${USE_METAL:-1}" = "1" ]; then
         METAL_FLAGS=(-DPUF_TRAIN_METAL)
         METAL_SRC=(-x objective-c++ -fobjc-arc src/puf_metal.mm)
         EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore)
         BACKEND_NAME="CPU trainer + Metal"
-        [ "${MAC_BF16:-0}" = "1" ] && BACKEND_NAME="$BACKEND_NAME, bf16"
+        [ "${MAC_BF16:-0}" = "1" ] && BACKEND_NAME="$BACKEND_NAME, bf16" || BACKEND_NAME="$BACKEND_NAME, fp32"
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN ($BACKEND_NAME)..."
     # C sources (e.g. impulse_wars_api.c) compile as C, not with -std=c++17

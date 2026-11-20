@@ -4,9 +4,9 @@ Two changes, both aimed at SPS:
 
 1. GEMMs on Metal Performance Primitives (MSL 4 tensor ops, macOS 26+)
    instead of MPSMatrixMultiplication.
-2. bf16 storage for activations and gradients (`./build.sh ENV --bf16`),
-   with fp32 master weights. This matches what the CUDA build does by
-   default.
+2. bf16 storage for activations and gradients, with fp32 master weights.
+   This is now the Mac default, as it is on CUDA (`./build.sh ENV`;
+   `--float` for fp32).
 
 Result: **bf16 is about 1.4–1.5x faster end to end on configs where the
 learner dominates (pacman, tetris) and about 1.1x on breakout, where env
@@ -151,4 +151,3 @@ No env hit the bf16 horizon constraint, and no losses went NaN.
   static extents.
 - `tests/test_metal_gemm.mm` still uses the older argument-buffer
   convention.
-- **bf16 as the Mac default:** it is opt-in for now.

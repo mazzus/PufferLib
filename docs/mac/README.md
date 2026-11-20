@@ -13,11 +13,11 @@ CUDA builds are unaffected.
 
 - `./build.sh ENV --no-metal` builds the CPU-only trainer (Accelerate +
   OpenMP).
-- Training is fp32 by default. `./build.sh ENV --bf16` builds bf16
-  activations/gradients with fp32 master weights (as on CUDA). It learns
-  the same and is 1.4–1.5x faster on learner-bound configs (pacman,
-  tetris), 1.1x on breakout (see PHASE6.md); it needs macOS 26
-  (MPP GEMMs). Checkpoints use the same flat fp32 format as CUDA and load
+- Precision matches CUDA: bf16 activations/gradients with fp32 master
+  weights by default (macOS 26+, for the MPP GEMMs). It learns the same as
+  fp32 and is 1.4–1.5x faster on learner-bound configs (pacman, tetris),
+  1.1x on breakout (see PHASE6.md). `--float` builds fp32. `--no-metal`
+  and macOS < 26 are always fp32. Checkpoints use the same flat fp32 format as CUDA and load
   in either direction.
 - `PUF_CPU_PROFILE=1 ./puffer train ...` prints a per-kernel profile, flush
   counts and GPU busy time.

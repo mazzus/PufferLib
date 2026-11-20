@@ -1810,7 +1810,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 #ifdef PUF_TRAIN_METAL
     if (USE_BF16 && !puf_metal_has_mpp_gemm()) {
         fprintf(stderr, "bf16 build needs the MPP GEMM library (src/puf_gemm.metal, "
-            "macOS 26+, run from the repo root); rebuild without --bf16\n");
+            "macOS 26+, run from the repo root); rebuild with --float\n");
         exit(1);
     }
 #endif
