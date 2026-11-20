@@ -7,7 +7,8 @@
 //   ./tests/oracle_train.sh            # builds build/oracle_train for this machine
 //   ./build/oracle_train_ENV out.bin [--section.key=value ...]
 //
-// Precision: build both sides fp32 (CUDA: --float).
+// Precision: fp32 by default; BF16=1 ./tests/oracle_train.sh builds bf16
+// (activations/grads bf16, fp32 master weights) on either backend.
 #include "pufferl.cu"
 
 static uint32_t lcg(uint32_t* s) {
@@ -89,6 +90,10 @@ int main(int argc, char** argv) {
         for (long i = 0; i < nw; i++) w[i] *= 1.0f + eps * lcg_unit(&ps);
     }
     upload(pol->master_weights.data, w, nw);
+    if (USE_BF16) {  // bf16: params are a separate copy of the fp32 masters
+        PUF_LAUNCH(cast, grid_size(nw), BLOCK_SIZE, 0, p->default_stream)(
+            pol->param.data, pol->master_weights.data, nw);
+    }
 
     // Synthetic rollout in the (T, B, ...) rollout layout
     RolloutBuf* rb = &p->rollouts;
@@ -166,6 +171,16 @@ int main(int argc, char** argv) {
     float* w2 = (float*)malloc(nw * sizeof(float));
     download(w2, pol->master_weights.data, nw);
     write_block(fp, "weights_out", w2, nw);
+    // Muon momentum (after one step: the clipped gradient, before Newton-Schulz)
+    // and the flat update buffer (NS output for 2D params), to localize diffs.
+    long nm = numel(p->muon.mb.shape);
+    float* hm = (float*)malloc(nm * sizeof(float));
+    cudaMemcpy(hm, p->muon.mb.data, nm * sizeof(float), cudaMemcpyDeviceToHost);
+    write_block(fp, "muon_mb", hm, nm);
+    long ng = numel(p->grad.shape);
+    float* hg = (float*)malloc(ng * sizeof(float));
+    download(hg, p->grad.data, ng);
+    write_block(fp, "update_buf", hg, ng);
     fclose(fp);
     printf("oracle: wrote %s (T=%d B=%d params=%ld minibatches=%d)\n", argv[1], T, B,
         nw, (int)(hy->replay_ratio * hy->total_agents * hy->horizon / hy->minibatch_size));

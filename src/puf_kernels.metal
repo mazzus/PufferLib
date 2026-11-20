@@ -113,6 +113,18 @@ kernel void transpose_102_p(constant Transpose& a [[buffer(0)]], KERNEL_IDX) {
     a.dst[b * a.A * a.C + ai * a.C + c] = a.src[idx];
 }
 
+struct TransposeF { device float* dst; device float* src; int A, B, C; };
+kernel void transpose_102_f(constant TransposeF& a [[buffer(0)]], KERNEL_IDX) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = a.A * a.B * a.C;
+    if (idx >= total) return;
+    int ai = idx / (a.B * a.C);
+    int rem = idx % (a.B * a.C);
+    int b = rem / a.C;
+    int c = rem % a.C;
+    a.dst[b * a.A * a.C + ai * a.C + c] = a.src[idx];
+}
+
 struct Clamp { PPtr dst; float lo, hi; int n; };
 kernel void clamp_precision_kernel(constant Clamp& a [[buffer(0)]], KERNEL_IDX) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < a.n;

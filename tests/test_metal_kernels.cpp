@@ -268,10 +268,12 @@ int main() {
         for (int i = 0; i < n; i++) ((unsigned char*)u.v)[i] = (unsigned char)(i * 37);
         c.zerosf((n + 3) / 4);                      // 6 uchar dst
         c.add(n, 0, 200);                           // 7 precision src for uchar
+        c.zerosf(n);                                // 8 float transpose dst
         diff("casts", c, [&](std::vector<Buf>& b) {
             PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE)(b[0].P(), b[1].F(), n);
 #ifndef PRECISION_FLOAT
             PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE)(b[2].F(), b[3].P(), n);
+            PUF_LAUNCH(transpose_102, grid_size(n), BLOCK_SIZE)(b[8].F(), (const float*)b[1].F(), 5, 40, 25);
 #endif
             PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE)(b[4].P(), (unsigned char*)b[5].v, n);
             PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE)((unsigned char*)b[6].v, b[7].P(), n);
@@ -351,6 +353,72 @@ int main() {
         printf("%s gemm forms x shapes (%s, %s), muon gram rel %.3e\n",
             md < gtol ? "ok  " : "FAIL", puf_metal_has_mpp_gemm() ? "MPP" : "MPS",
             USE_BF16 ? "bf16" : "fp32", md);
+    }
+    {   // Muon Newton-Schulz (5 steps, wide and tall) on the GEMM path vs a host
+        // reference that rounds to precision_t at the same points.
+        for (auto rc : {std::pair<int, int>{256, 768}, std::pair<int, int>{768, 256}}) {
+            int R = rc.first, Cc = rc.second, M = R < Cc ? R : Cc;
+            bool tall = R > Cc;
+            long ne = (long)R * Cc;
+            precision_t *x, *xb, *g, *gb;
+            cudaMalloc(&x, ne * sizeof(precision_t)); cudaMalloc(&xb, ne * sizeof(precision_t));
+            cudaMalloc(&g, (long)M * M * sizeof(precision_t));
+            cudaMalloc(&gb, (long)M * M * sizeof(precision_t));
+            double nrm = 0;
+            std::vector<float> hx(ne);
+            for (long i = 0; i < ne; i++) { float v = urand(); nrm += (double)v * v; hx[i] = v; }
+            for (long i = 0; i < ne; i++) { x[i] = from_float(hx[i] / (float)sqrt(nrm)); hx[i] = to_float(x[i]); }
+            std::vector<float> hxb(ne), hg((long)M * M), hgb((long)M * M);
+            auto rnd = [](double v) { return to_float(from_float((float)v)); };
+            Prec px = P(x, R, Cc), pxb = P(xb, R, Cc), pgm = P(g, M, M), pgb = P(gb, M, M);
+            for (int it = 0; it < 5; it++) {
+                Prec& src = it % 2 == 0 ? px : pxb;
+                Prec& dst = it % 2 == 0 ? pxb : px;
+                std::vector<float>& hs = it % 2 == 0 ? hx : hxb;
+                std::vector<float>& hd = it % 2 == 0 ? hxb : hx;
+                float c0 = ns_coeffs[it][0], c1 = ns_coeffs[it][1], c2 = ns_coeffs[it][2];
+                if (tall) puf_mm_tn(&src, &src, &pgm, 0); else puf_mm(&src, &src, &pgm, 0);
+                puf_copy(&pgb, &pgm, 0);
+                puf_mm_nn(&pgm, &pgm, &pgb, 0, c2, c1);
+                puf_copy(&dst, &src, 0);
+                if (tall) puf_mm_nn(&src, &pgb, &dst, 0, 1.0f, c0);
+                else puf_mm_nn(&pgb, &src, &dst, 0, 1.0f, c0);
+                // host: gram = S S^T (wide) or S^T S (tall)
+                for (int i = 0; i < M; i++) for (int j = 0; j < M; j++) {
+                    double acc = 0;
+                    if (tall) for (int k = 0; k < R; k++) acc += (double)hs[(long)k * Cc + i] * hs[(long)k * Cc + j];
+                    else for (int k = 0; k < Cc; k++) acc += (double)hs[(long)i * Cc + k] * hs[(long)j * Cc + k];
+                    hg[(long)i * M + j] = rnd(acc);
+                }
+                for (int i = 0; i < M; i++) for (int j = 0; j < M; j++) {
+                    double acc = 0;
+                    for (int k = 0; k < M; k++) acc += (double)hg[(long)i * M + k] * hg[(long)k * M + j];
+                    hgb[(long)i * M + j] = rnd((float)(c2 * acc) + c1 * hg[(long)i * M + j]);
+                }
+                for (int i = 0; i < R; i++) for (int j = 0; j < Cc; j++) {
+                    double acc = 0;
+                    if (tall) for (int k = 0; k < M; k++) acc += (double)hs[(long)i * Cc + k] * hgb[(long)k * M + j];
+                    else for (int k = 0; k < M; k++) acc += (double)hgb[(long)i * M + k] * hs[(long)k * Cc + j];
+                    hd[(long)i * Cc + j] = rnd((float)acc + c0 * hs[(long)i * Cc + j]);
+                }
+            }
+            cudaDeviceSynchronize();
+            double num = 0, den = 0, num_g = 0, den_g = 0;
+            for (long i = 0; i < ne; i++) {
+                double d = to_float(xb[i]) - hxb[i];
+                num += d * d; den += (double)hxb[i] * hxb[i];
+            }
+            for (long i = 0; i < (long)M * M; i++) {
+                double d = to_float(gb[i]) - hgb[i];
+                num_g += d * d; den_g += (double)hgb[i] * hgb[i];
+            }
+            double rel = sqrt(num / den);
+            bool ok = rel < (USE_BF16 ? 5e-2 : 1e-4);
+            failures += !ok;
+            printf("%s muon NS %dx%d                  rel L2 %.3e (last gram_buf %.3e)\n",
+                ok ? "ok  " : "FAIL", R, Cc, rel, sqrt(num_g / den_g));
+            cudaFree(x); cudaFree(xb); cudaFree(g); cudaFree(gb);
+        }
     }
     printf(failures ? "FAILED: %d\n" : "OK\n", failures);
     return failures != 0;
