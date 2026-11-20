@@ -8,8 +8,9 @@ Two changes, both aimed at SPS:
    with fp32 master weights. This matches what the CUDA build does by
    default.
 
-Result: **bf16 trains about 1.4–1.5x faster than fp32 on Metal and learns
-the same.**
+Result: **bf16 is about 1.4–1.5x faster end to end on configs where the
+learner dominates (pacman, tetris) and about 1.1x on breakout, where env
+and rollout dominate. It learns the same as fp32.**
 
 ## MPP GEMMs
 
@@ -91,7 +92,8 @@ itself.
 
 ### Learning
 
-Full-length runs, Metal fp32 vs Metal bf16:
+Metal fp32 vs Metal bf16 (breakout and pacman at full length; tetris at
+150M of its 1.9B steps):
 
 | env | steps | fp32 score | bf16 score |
 |---|---|---|---|
@@ -100,7 +102,8 @@ Full-length runs, Metal fp32 vs Metal bf16:
 | tetris | 150M | 79.6 | 83.8 |
 | chain_mdp, uchar obs (seeds 1–4, best perf) | 5M | 0.28 / 0 / 0.002 / 0 | 0.38 / 0 / 0 / 0 |
 
-bf16 learns the same as fp32 within seed spread. Envs with uchar
+bf16 learns the same as fp32: within seed spread on breakout (3 seeds),
+and within a single-seed comparison on pacman and tetris. Envs with uchar
 observations train in bf16 too; the obs cast to bf16 is exact for 0–255.
 
 ### Speed

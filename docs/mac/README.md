@@ -14,8 +14,9 @@ CUDA builds are unaffected.
 - `./build.sh ENV --no-metal` builds the CPU-only trainer (Accelerate +
   OpenMP).
 - Training is fp32 by default. `./build.sh ENV --bf16` builds bf16
-  activations/gradients with fp32 master weights (as on CUDA), about
-  1.4–1.5x faster and learning the same (see PHASE6.md); it needs macOS 26
+  activations/gradients with fp32 master weights (as on CUDA). It learns
+  the same and is 1.4–1.5x faster on learner-bound configs (pacman,
+  tetris), 1.1x on breakout (see PHASE6.md); it needs macOS 26
   (MPP GEMMs). Checkpoints use the same flat fp32 format as CUDA and load
   in either direction.
 - `PUF_CPU_PROFILE=1 ./puffer train ...` prints a per-kernel profile, flush
@@ -28,6 +29,10 @@ CUDA builds are unaffected.
 | breakout | ~2.95M | ~3.2M | ~480K | 22.9M |
 | pacman | ~325K | ~460K | ~42K | 4.1M |
 | tetris | ~200K | ~290K | ~54K | 3.2M |
+
+Metal fp32 and bf16 are steps / wall time (startup included): breakout
+55M steps, pacman 205M, tetris 150M (PHASE6.md). The CPU-only column used
+shorter runs (PHASE1.md).
 
 - **Coverage:** 70 of 85 envs train (see PHASE5.md). Envs with custom CUDA
   policy nets (asteroids, minimal, craftax, nmmo3, osrs_*, nethack) are not
