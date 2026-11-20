@@ -88,19 +88,21 @@ int main() {
             {"tetris rollout mingru 4096x1536x512", 4096, 1536, 512},
             {"tetris train mingru 65536x1536x512", 65536, 1536, 512},
         };
-        printf("%-40s %10s %10s %10s %10s %10s\n", "shape", "cpu_us", "cpu_TF",
-            "gpu32_us", "gpu32_TF", "gpu16_TF");
+        printf("%-40s %8s %8s | batched cb TF: %8s %8s %8s\n", "shape", "cpu_TF",
+            "gpu32_TF", "fp32", "fp16", "bf16");
         for (Shape s : shapes) {
             double flop = 2.0 * s.M * s.N * s.K;
             int iters = flop > 5e10 ? 10 : (flop > 1e9 ? 50 : 500);
+            int pcb = iters < 50 ? iters : 50;
             double tc = bench_cpu(s, iters);
             double tg = bench_gpu(dev, q, s, MPSDataTypeFloat32, iters, 1);
-            double th = bench_gpu(dev, q, s, MPSDataTypeFloat16, iters, 1);
             // Many GEMMs in one command buffer: the trainer's steady state
-            double tgb = bench_gpu(dev, q, s, MPSDataTypeFloat32, iters, iters < 50 ? iters : 50);
-            printf("%-40s %10.1f %10.2f %10.1f %10.2f %10.2f  (batched cb: %.1f us, %.2f TF)\n",
-                s.name, tc * 1e6, flop / tc / 1e12, tg * 1e6, flop / tg / 1e12,
-                flop / th / 1e12, tgb * 1e6, flop / tgb / 1e12);
+            double b32 = bench_gpu(dev, q, s, MPSDataTypeFloat32, iters, pcb);
+            double b16 = bench_gpu(dev, q, s, MPSDataTypeFloat16, iters, pcb);
+            double bbf = 1e9;  // MPSMatrix has no bf16
+            printf("%-40s %8.2f %8.2f | %22.2f %8.2f %8.2f\n", s.name,
+                flop / tc / 1e12, flop / tg / 1e12, flop / b32 / 1e12,
+                flop / b16 / 1e12, flop / bbf / 1e12);
         }
     }
     return 0;

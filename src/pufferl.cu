@@ -188,6 +188,7 @@ __global__ void cast(precision_t* dst,
         dst[idx] = src[idx];
     }
 }
+PUF_METAL_PORT(cast, "cast_p_p", (precision_t* dst, precision_t* src, int n), (dst, src, n))
 
 __global__ void cast(float* dst,
         precision_t* src, int n) {
@@ -196,6 +197,7 @@ __global__ void cast(float* dst,
         dst[idx] = to_float(src[idx]);
     }
 }
+PUF_METAL_PORT(cast, "cast_f_p", (float* dst, precision_t* src, int n), (dst, src, n))
 #endif
 
 __global__ void cast(precision_t* dst,
@@ -1452,6 +1454,7 @@ __global__ void transpose_102(float* dst, const float* src, int A, int B, int C)
     int c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
+PUF_METAL_PORT(transpose_102, "transpose_102_f", (float* dst, const float* src, int A, int B, int C), (dst, src, A, B, C))
 #endif
 
 // Cosine decay base → min over t in [0, T). Double for t/T (float loses
@@ -1804,6 +1807,13 @@ static void master_weights_setup(Float* mw, Prec* param,
 }
 
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
+#ifdef PUF_TRAIN_METAL
+    if (USE_BF16 && !puf_metal_has_mpp_gemm()) {
+        fprintf(stderr, "bf16 build needs the MPP GEMM library (src/puf_gemm.metal, "
+            "macOS 26+, run from the repo root); rebuild with --float\n");
+        exit(1);
+    }
+#endif
     Hypers hypers = {
         .horizon = puf_ini_get(ini, "train", "horizon"),
         .total_agents = puf_ini_get(ini, "vec", "total_agents"),

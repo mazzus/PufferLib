@@ -1462,7 +1462,8 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 #ifdef PUF_TRAIN_METAL
 // Env compile-time constants for the Metal kernel library (compiled lazily).
 static int puf_metal_env_defs = (puf_metal_define("PUF_NUM_ATNS", NUM_ATNS),
-    puf_metal_define("PUF_MAX_HEAD_A", PPO_MAX_HEAD_A), 0);
+    puf_metal_define("PUF_MAX_HEAD_A", PPO_MAX_HEAD_A),
+    USE_BF16 ? puf_metal_define("PUF_BF16", 1) : (void)0, 0);
 #endif
 
 // Fused loss function. PPO clipped loss + value + entropy

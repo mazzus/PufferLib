@@ -39,11 +39,19 @@ void puf_metal_fill(void* dst, int value, size_t bytes);
 // flush. Returns 0 if the copy is too large; the caller then flushes + memcpy.
 int puf_metal_upload(void* dst, const void* src, size_t bytes);
 
-// Column-major GEMM with cublasGemmEx semantics, fp32, all operands in the
+// Column-major GEMM with cublasGemmEx semantics, fp32 (MPP kernels, else MPS), all operands in the
 // arena: C(m,n) = alpha * op(A) @ op(B) + beta * C.
 void puf_metal_sgemm(int trans_a, int trans_b, int m, int n, int k,
     float alpha, const float* A, int lda, const float* B, int ldb,
     float beta, float* C, int ldc);
+
+// bf16 GEMM (A, B, C bf16, fp32 accumulation), same cuBLAS column-major
+// semantics. Needs the MPP GEMM library (src/puf_gemm.metal, macOS 26+).
+void puf_metal_gemm_bf16(int trans_a, int trans_b, int m, int n, int k,
+    float alpha, const void* A, int lda, const void* B, int ldb,
+    float beta, void* C, int ldc);
+// 1 if the MPP GEMM library loaded (fp32 GEMMs use it; else MPS).
+int puf_metal_has_mpp_gemm(void);
 
 // Compute dispatch of a kernel from the Metal kernel library. args/args_len
 // is the kernel's argument struct (bound with setBytes at index 0).
