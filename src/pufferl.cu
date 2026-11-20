@@ -188,6 +188,7 @@ __global__ void cast(precision_t* dst,
         dst[idx] = src[idx];
     }
 }
+PUF_METAL_PORT(cast, "cast_p_p", (precision_t* dst, precision_t* src, int n), (dst, src, n))
 
 __global__ void cast(float* dst,
         precision_t* src, int n) {
@@ -196,6 +197,7 @@ __global__ void cast(float* dst,
         dst[idx] = to_float(src[idx]);
     }
 }
+PUF_METAL_PORT(cast, "cast_f_p", (float* dst, precision_t* src, int n), (dst, src, n))
 #endif
 
 __global__ void cast(precision_t* dst,

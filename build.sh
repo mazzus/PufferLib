@@ -10,6 +10,7 @@ set -e
 #   ./build.sh breakout --cpu        # Play/eval binary (optimized) -> ./ENV
 #   ./build.sh breakout              # macOS: trainer with the Metal GPU backend (default)
 #   ./build.sh breakout --no-metal   # macOS: CPU-only trainer backend
+#   ./build.sh breakout --bf16       # macOS Metal: bf16 activations/grads (fp32 masters)
 #   ./build.sh osrs_inferno --cpu     # OSRS visual policy viewer -> ./osrs_inferno
 #   ./build.sh nethack --cpu          # NetHack TTY demo (ocean/nethack/nethack.c)
 #   ./build.sh breakout myplay --cpu # Play -> ./myplay
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
         --cpu)   MODE=cpu ;;
         --metal) USE_METAL=1 ;;
         --no-metal) USE_METAL=0 ;;
+        --bf16) MAC_BF16=1 ;;
         *) echo "Error: unknown argument '$1'" && exit 1 ;;
     esac
     shift
@@ -426,7 +428,8 @@ fi
 
 # No CUDA (macOS): CPU trainer backend. The same CUDA C++ trainer sources
 # compile as C++ against src/puf_cuda_cpu.h; kernels run as host loops and
-# GEMMs go to Accelerate. fp32 only (implies --float).
+# GEMMs go to Accelerate. fp32 by default; --bf16 (Metal only) stores
+# activations/gradients in bf16 like the CUDA default.
 if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     if [ "$USE_GPU_ENV" = "1" ]; then
         echo "Error: --cu envs need CUDA; the CPU trainer supports .h envs" >&2
@@ -445,12 +448,21 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
     fi
     METAL_SRC=()
     METAL_FLAGS=()
+    MAC_PRECISION=(-DPRECISION_FLOAT)
     BACKEND_NAME="CPU trainer"
+    if [ "${MAC_BF16:-0}" = "1" ]; then
+        if [ "${USE_METAL:-1}" != "1" ]; then
+            echo "Error: --bf16 needs the Metal backend" >&2
+            exit 1
+        fi
+        MAC_PRECISION=()
+    fi
     if [ "${USE_METAL:-1}" = "1" ]; then
         METAL_FLAGS=(-DPUF_TRAIN_METAL)
         METAL_SRC=(-x objective-c++ -fobjc-arc src/puf_metal.mm)
         EXTRA_LDFLAGS+=(-framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore)
         BACKEND_NAME="CPU trainer + Metal"
+        [ "${MAC_BF16:-0}" = "1" ] && BACKEND_NAME="$BACKEND_NAME, bf16"
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN ($BACKEND_NAME)..."
     # C sources (e.g. impulse_wars_api.c) compile as C, not with -std=c++17
@@ -466,7 +478,7 @@ if [ "$PLATFORM" != "Linux" ] && [ "${MODE:-native}" = "native" ]; then
         -Wno-narrowing -Wno-c99-designator -Wno-unreachable-code \
         -Wno-vla-cxx-extension -Wno-unused-function -Wno-unused-variable \
         -I. -Isrc -I$SRC_DIR -Ivendor "${INCLUDES[@]}" \
-        -DPUF_TRAIN_CPU -DPRECISION_FLOAT "${METAL_FLAGS[@]}" \
+        -DPUF_TRAIN_CPU "${MAC_PRECISION[@]}" "${METAL_FLAGS[@]}" \
         -DENV_HEADER=\"$ENV_HEADER\" \
         -DENV_NAME=$ENV \
         -DPUFFER_ENV_NAME=\"$ENV\" \
