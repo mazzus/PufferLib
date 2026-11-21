@@ -35,19 +35,26 @@ def stats(ref, cand):
     return maxdiff, maxdiff / scale
 
 
+def exact(ref, cand):
+    """Fraction of bit-identical elements (bf16 dumps: a rounding flip is 1 ulp)."""
+    return sum(r == c for r, c in zip(ref, cand)) / max(len(ref), 1)
+
+
 def main():
     ref, cand = load(sys.argv[1]), load(sys.argv[2])
     worst = 0.0
     for name in ref:
         d, rel = stats(ref[name], cand[name])
-        print(f"{name:14s} n={len(ref[name]):8d} max_abs={d:.3e} max_rel={rel:.3e}")
+        print(f"{name:14s} n={len(ref[name]):8d} max_abs={d:.3e} max_rel={rel:.3e}"
+              f" exact={exact(ref[name], cand[name]):.4f}")
         if name != "weights_in":
             worst = max(worst, rel)
     if "weights_in" in ref and "weights_out" in ref:
         upd_r = array("f", (o - i for o, i in zip(ref["weights_out"], ref["weights_in"])))
         upd_c = array("f", (o - i for o, i in zip(cand["weights_out"], cand["weights_in"])))
         d, rel = stats(upd_r, upd_c)
-        print(f"{'update':14s} n={len(upd_r):8d} max_abs={d:.3e} max_rel={rel:.3e}")
+        print(f"{'update':14s} n={len(upd_r):8d} max_abs={d:.3e} max_rel={rel:.3e}"
+              f" exact={exact(upd_r, upd_c):.4f}")
         worst = max(worst, rel)
     names = ["policy", "value", "entropy", "total", "old_kl", "kl", "clipfrac", "imp", "count"]
     if "losses" in ref:

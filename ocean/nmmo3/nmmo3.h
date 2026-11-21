@@ -516,7 +516,7 @@ void generate_terrain(char* terrain, unsigned char* rendered,
     // Cellular automata to cover unfilled ridges
     cellular_automata(biomes, R, C, 4, 4000, rng);
 
-    unsigned char (*rendered_ary)[C][3] = (unsigned char(*)[C][3])rendered;
+    PUF_VLA_PTR(rendered_ary, (unsigned char(*)[C][3])rendered);
 
     for (int r = 0; r < R; r++) {
         for (int c = 0; c < C; c++) {
@@ -1438,7 +1438,7 @@ int find_target(MMO* env, int pid, int entity_type) {
     }
 
     entity->anim = anim;
-    int (*deltas)[num_deltas][2] = (int(*)[num_deltas][2])flat_deltas;
+    PUF_VLA_PTR(deltas, (int(*)[num_deltas][2])flat_deltas);
     for (int direction = 0; direction < 4; direction++) {
         for (int idx = 0; idx < num_deltas; idx++) {
             int dr = deltas[direction][idx][0];
@@ -2461,8 +2461,8 @@ Animation ANIMATIONS[7] = {
 
 void render_conversion(char* flat_tiles, int* flat_converted, int R, int C, unsigned int* rng) {
     char* tex_codes = tile_atlas;
-    char (*tiles)[C] = (char(*)[C])flat_tiles;
-    int (*converted)[C] = (int(*)[C])flat_converted;
+    PUF_VLA_PTR(tiles, (char(*)[C])flat_tiles);
+    PUF_VLA_PTR(converted, (int(*)[C])flat_converted);
 
     for (int r = 1; r < R-1; r++) {
         for (int c = 1; c < C-1; c++) {

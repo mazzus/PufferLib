@@ -250,8 +250,8 @@ float fast_rng(CachedRNG* rng) {
 
 int bfs(Map *map, unsigned char *flat_paths, int* flat_buffer, int dest_r, int dest_c) {
     int N = map->width;
-    unsigned char (*paths)[N] = (unsigned char(*)[N])flat_paths;
-    int (*buffer)[3] = (int(*)[3])flat_buffer;
+    PUF_VLA_PTR(paths, (unsigned char(*)[N])flat_paths);
+    PUF_VLA_PTR(buffer, (int(*)[3])flat_buffer);
 
     int start = 0;
     int end = 1;

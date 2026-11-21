@@ -22,8 +22,10 @@
 //   - NCCL, NVML, NVTX and the profiler API are stubs (single process only).
 #pragma once
 
-#ifndef PRECISION_FLOAT
-#error "PUF_TRAIN_CPU requires PRECISION_FLOAT (build with --float)"
+// bf16 (no PRECISION_FLOAT) needs the Metal backend: bf16 GEMMs run on the
+// GPU (src/puf_gemm.metal); host-run kernels convert via to_float/from_float.
+#if !defined(PRECISION_FLOAT) && !defined(PUF_TRAIN_METAL)
+#error "PUF_TRAIN_CPU without Metal requires PRECISION_FLOAT (build with --float)"
 #endif
 
 #include <math.h>
@@ -48,6 +50,19 @@ typedef unsigned long ulong;
 
 constexpr bool PUF_HOST_KERNELS = true;
 
+// Metal backend (-DPUF_TRAIN_METAL): device memory is a shared MTLBuffer arena,
+// GEMMs/copies/fills run on the GPU, and ported kernels dispatch to Metal.
+// Anything else runs on the host after flushing the thread's GPU work.
+#ifdef PUF_TRAIN_METAL
+#include "puf_metal.h"
+#define PUF_METAL_FLUSH() puf_metal_flush()
+// MinGRU uses the GPU-portable kernels (ported to Metal) instead of host versions
+constexpr bool PUF_HOST_MINGRU = false;
+#else
+#define PUF_METAL_FLUSH() ((void)0)
+constexpr bool PUF_HOST_MINGRU = true;
+#endif
+
 [[noreturn]] static inline void puf_cpu_fatal(const char* what) {
     fprintf(stderr, "PUF_TRAIN_CPU: unsupported: %s\n", what);
     abort();
@@ -69,7 +84,7 @@ struct dim3 {
         : x(x_), y(y_), z(z_) {}
 };
 struct float4 { float x, y, z, w; };
-struct uint4 { unsigned int x, y, z, w; };
+struct alignas(16) uint4 { unsigned int x, y, z, w; };
 struct uint2 { unsigned int x, y; };
 static inline float4 make_float4(float x, float y, float z, float w) {
     return {x, y, z, w};
@@ -99,20 +114,32 @@ static inline auto min(A a, B b) { return a < b ? a : b; }
 template <class A, class B>
 static inline auto max(A a, B b) { return a < b ? b : a; }
 
-// bf16 storage type (only for the GPU-env obs widen overload; fp32 training)
-struct __nv_bfloat16 { uint16_t x; };
-static inline float __bfloat162float(__nv_bfloat16 b) {
-    uint32_t bits = (uint32_t)b.x << 16;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
-static inline __nv_bfloat16 __float2bfloat16(float f) {
+// bf16 storage type (round-to-nearest-even like cuda_bf16.h). Used for the
+// GPU-env obs widen overload in fp32 builds and as precision_t in bf16 builds.
+// Converts implicitly to and from float like the host side of cuda_bf16.h,
+// so env headers that write float expressions into obs_t compile unchanged.
+static inline uint16_t puf_f32_to_bf16_bits(float f) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (uint16_t)((bits >> 16) | 0x40u);  // NaN stays (quiet) NaN
+    }
     uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);
-    return {(uint16_t)((bits + rounding) >> 16)};
+    return (uint16_t)((bits + rounding) >> 16);
 }
+struct __nv_bfloat16 {
+    uint16_t x;
+    __nv_bfloat16() = default;
+    __nv_bfloat16(float f) : x(puf_f32_to_bf16_bits(f)) {}
+    operator float() const {
+        uint32_t bits = (uint32_t)x << 16;
+        float f;
+        memcpy(&f, &bits, 4);
+        return f;
+    }
+};
+static inline float __bfloat162float(__nv_bfloat16 b) { return (float)b; }
+static inline __nv_bfloat16 __float2bfloat16(float f) { return __nv_bfloat16(f); }
 
 // Deterministic block reduce, emulation version. Same tree order as the CUDA
 // version in pufferl.cu (which is skipped via this guard). Threads run
@@ -166,7 +193,20 @@ static inline unsigned long long puf_cpu_now_ns() {
     return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+static inline cudaError_t puf_cpu_host_malloc(void** p, size_t n) {
+    void* mem = NULL;
+    if (posix_memalign(&mem, 64, n ? n : 64) != 0) {
+        return 2;
+    }
+    memset(mem, 0, n);
+    *p = mem;
+    return cudaSuccess;
+}
 static inline cudaError_t puf_cpu_malloc(void** p, size_t n) {
+#ifdef PUF_TRAIN_METAL
+    *p = puf_metal_alloc(n);
+    return cudaSuccess;
+#endif
     void* mem = NULL;
     if (posix_memalign(&mem, 64, n ? n : 64) != 0) {
         return 2;
@@ -179,11 +219,31 @@ template <class T> static inline cudaError_t cudaMalloc(T** p, size_t n) {
     return puf_cpu_malloc((void**)p, n);
 }
 template <class T> static inline cudaError_t cudaHostAlloc(T** p, size_t n, unsigned) {
-    return puf_cpu_malloc((void**)p, n);
+    return puf_cpu_host_malloc((void**)p, n);
 }
-static inline cudaError_t cudaFree(void* p) { free(p); return cudaSuccess; }
+static inline cudaError_t cudaFree(void* p) {
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(p)) {
+        puf_metal_free(p);
+        return cudaSuccess;
+    }
+#endif
+    free(p);
+    return cudaSuccess;
+}
 static inline cudaError_t cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind) {
-    if (n) memmove(d, s, n);
+    if (!n) return cudaSuccess;
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(d) && puf_metal_owns(s)) {
+        puf_metal_copy(d, s, n);
+        return cudaSuccess;
+    }
+    if (puf_metal_owns(d) && puf_metal_upload(d, s, n)) {
+        return cudaSuccess;
+    }
+    puf_metal_flush();
+#endif
+    memmove(d, s, n);
     return cudaSuccess;
 }
 static inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n,
@@ -191,7 +251,14 @@ static inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n,
     return cudaMemcpy(d, s, n, k);
 }
 static inline cudaError_t cudaMemset(void* p, int v, size_t n) {
-    if (n) memset(p, v, n);
+    if (!n) return cudaSuccess;
+#ifdef PUF_TRAIN_METAL
+    if (puf_metal_owns(p)) {
+        puf_metal_fill(p, v, n);
+        return cudaSuccess;
+    }
+#endif
+    memset(p, v, n);
     return cudaSuccess;
 }
 static inline cudaError_t cudaMemsetAsync(void* p, int v, size_t n, cudaStream_t = 0) {
@@ -204,7 +271,7 @@ static inline cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
 }
 static inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
 static inline cudaError_t cudaGetDeviceCount(int* n) { *n = 1; return cudaSuccess; }
-static inline cudaError_t cudaDeviceSynchronize() { return cudaSuccess; }
+static inline cudaError_t cudaDeviceSynchronize() { PUF_METAL_FLUSH(); return cudaSuccess; }
 static inline cudaError_t cudaProfilerStart() { return cudaSuccess; }
 static inline cudaError_t cudaProfilerStop() { return cudaSuccess; }
 
@@ -215,7 +282,7 @@ static inline cudaError_t cudaStreamCreate(cudaStream_t* s) {
 static inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned) {
     return cudaStreamCreate(s);
 }
-static inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+static inline cudaError_t cudaStreamSynchronize(cudaStream_t) { PUF_METAL_FLUSH(); return cudaSuccess; }
 static inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) {
     return cudaSuccess;
 }
@@ -274,6 +341,14 @@ static inline void puf_prof_dump() {
         }
     }
     fprintf(stderr, "\nPUF_CPU_PROFILE (total %.2fs)\n", total);
+#ifdef PUF_TRAIN_METAL
+    long fl, gm, dp, bl;
+    puf_metal_stats(&fl, &gm, &dp, &bl);
+    fprintf(stderr, "metal: flushes=%ld gemms=%ld dispatches=%ld blits=%ld\n", fl, gm, dp, bl);
+    double gpu_s, wait_s;
+    puf_metal_times(&gpu_s, &wait_s);
+    fprintf(stderr, "metal: gpu busy %.2fs (summed over threads), host wait %.2fs\n", gpu_s, wait_s);
+#endif
     for (int i = 0; i < puf_prof_n && i < 40; i++) {
         PufProfEntry* e = &puf_prof_tab[i];
         fprintf(stderr, "%8.3fs %5.1f%% %9ld  %s\n", e->sec, 100 * e->sec / total,
@@ -305,15 +380,19 @@ static inline void puf_prof_add(const char* key, double sec) {
     }
 }
 
+// Entry of a host-native kernel (reads/writes device memory on the host).
 struct PufProfScope {
     const char* name;
     double t0;
-    PufProfScope(const char* n) : name(n), t0(puf_prof_enabled() ? puf_cpu_now_s() : 0.0) {}
+    PufProfScope(const char* n) : name(n), t0(0.0) {
+        PUF_METAL_FLUSH();
+        t0 = puf_prof_enabled() ? puf_cpu_now_s() : 0.0;
+    }
     ~PufProfScope() {
         if (puf_prof_on == 1) puf_prof_add(name, puf_cpu_now_s() - t0);
     }
 };
-#define PUF_HOST_PROF_SCOPE(name) PufProfScope _puf_prof_scope(name)
+#define PUF_HOST_KERNEL_SCOPE(name) PufProfScope _puf_prof_scope(name)
 
 // Kernel launch
 struct PufLaunchCfg {
@@ -325,12 +404,99 @@ static inline PufLaunchCfg puf_cfg(dim3 grid, dim3 block, size_t smem = 0,
     return {grid, block, smem};
 }
 
+// Metal kernel ports. A ported kernel gets one overload of puf_metal_try for
+// its kernel id (declared next to the CUDA kernel via PUF_METAL_PORT). The
+// overload has the kernel's exact parameter types, so overloaded kernels
+// resolve as in CUDA, and marshals the parameters (in order, natural
+// alignment, arena pointers as GPU addresses) into the MSL argument struct.
+// The variadic fallback (worst conversion rank) means "not ported".
+constexpr uint64_t puf_hash(const char* s) {
+    uint64_t h = 1469598103934665603ull;
+    while (*s) {
+        h = (h ^ (uint64_t)(unsigned char)*s++) * 1099511628211ull;
+    }
+    return h;
+}
+template <uint64_t H> struct PufKernelId {};
+struct PufLaunchCfg;
+template <uint64_t H>
+static inline bool puf_metal_try(PufKernelId<H>, const PufLaunchCfg&, ...) {
+    return false;
+}
+// Host-emulated kernels that only touch memory the GPU never uses can run
+// without flushing pending GPU work (PUF_HOST_NOFLUSH next to the kernel).
+template <uint64_t H> static inline bool puf_host_noflush(PufKernelId<H>) { return false; }
+#define PUF_HOST_NOFLUSH(kernel) \
+    static inline bool puf_host_noflush(PufKernelId<puf_hash(#kernel)>) { return true; }
+
+struct PufArgWriter {
+    alignas(16) unsigned char buf[2048];
+    size_t len = 0;
+    bool ok = true;
+    void align(size_t a) { len = (len + a - 1) & ~(a - 1); }
+    void raw(const void* p, size_t n, size_t a) {
+        align(a);
+        if (len + n > sizeof(buf)) { ok = false; return; }
+        memcpy(buf + len, p, n);
+        len += n;
+    }
+    template <class... A> bool put(const A&... a);
+};
+#ifdef PUF_TRAIN_METAL
+template <class T> static inline void puf_put(PufArgWriter& w, T* p) {
+    if (p != NULL && !puf_metal_owns(p)) {
+        w.ok = false;  // host pointer: cannot run on the GPU
+    }
+    uint64_t a = puf_metal_gpu_address(w.ok ? p : NULL);
+    w.raw(&a, 8, 8);
+}
+#endif
+static inline void puf_put(PufArgWriter& w, int v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, unsigned int v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, float v) { w.raw(&v, 4, 4); }
+static inline void puf_put(PufArgWriter& w, bool v) { w.raw(&v, 1, 1); }
+static inline void puf_put(PufArgWriter& w, long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, long long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, unsigned long v) { w.raw(&v, 8, 8); }
+static inline void puf_put(PufArgWriter& w, unsigned long long v) { w.raw(&v, 8, 8); }
+template <class... A> bool PufArgWriter::put(const A&... a) {
+    (puf_put(*this, a), ...);
+    align(16);
+    return ok;
+}
+#define PUF_UNPAREN(...) __VA_ARGS__
+#ifdef PUF_TRAIN_METAL
+// PUF_METAL_PORT(kernel, "msl_name", (param decls), (param names))
+#define PUF_METAL_PORT(kernel, msl, params, args) \
+    static inline bool puf_metal_try(PufKernelId<puf_hash(#kernel)>, \
+            const PufLaunchCfg& _c, PUF_UNPAREN params) { \
+        PufArgWriter _w; \
+        if (!_w.put args) return false; \
+        return puf_metal_launch(msl, _c, _w); \
+    }
+#else
+#define PUF_METAL_PORT(kernel, msl, params, args)
+#endif
+
 // Below this many total threads, run blocks on the calling thread.
 #ifndef PUF_CPU_PAR_MIN_THREADS
 #define PUF_CPU_PAR_MIN_THREADS 32768
 #endif
 
-template <class F> struct PufLaunch {
+#ifdef PUF_TRAIN_METAL
+// Set to force every kernel onto the CPU emulation (differential tests).
+inline bool puf_metal_force_cpu = false;
+static inline bool puf_metal_launch(const char* msl, const PufLaunchCfg& c, PufArgWriter& w) {
+    if (puf_metal_force_cpu || !puf_metal_has_kernel(msl)) {
+        return false;
+    }
+    puf_metal_dispatch(msl, c.grid.x, c.grid.y, c.grid.z, c.block.x, c.block.y,
+        c.block.z, w.buf, w.len);
+    return true;
+}
+#endif
+
+template <uint64_t H, class F> struct PufLaunch {
     PufLaunchCfg c;
     F f;
     const char* name;
@@ -359,6 +525,20 @@ template <class F> struct PufLaunch {
     template <class... A> void operator()(A... a) {
         bool prof = puf_prof_enabled();
         double t0 = prof ? puf_cpu_now_s() : 0.0;
+#ifdef PUF_TRAIN_METAL
+        if (puf_metal_try(PufKernelId<H>{}, c, a...)) {
+            if (prof) {
+                char key[96];
+                snprintf(key, sizeof(key), "metal %s (encode)", name);
+                puf_prof_add(key, puf_cpu_now_s() - t0);
+            }
+            return;
+        }
+#endif
+        if (!puf_host_noflush(PufKernelId<H>{})) {
+            PUF_METAL_FLUSH();
+        }
+        if (prof) t0 = puf_cpu_now_s();
         launch(a...);
         if (prof) {
             puf_prof_add(name, puf_cpu_now_s() - t0);
@@ -384,13 +564,14 @@ template <class F> struct PufLaunch {
         }
     }
 };
-template <class F> static inline PufLaunch<F> puf_launch(PufLaunchCfg c, F f,
-        const char* name) {
-    return PufLaunch<F>{c, f, name};
+template <uint64_t H, class F> static inline PufLaunch<H, F> puf_launch(PufLaunchCfg c,
+        F f, const char* name) {
+    return PufLaunch<H, F>{c, f, name};
 }
 // PUF_LAUNCH(kernel, grid, block[, smem[, stream]])(args...)
 #define PUF_LAUNCH(kernel, ...) \
-    puf_launch(puf_cfg(__VA_ARGS__), [](auto&... _puf_a) { kernel(_puf_a...); }, #kernel)
+    puf_launch<puf_hash(#kernel)>(puf_cfg(__VA_ARGS__), \
+        [](auto&... _puf_a) { kernel(_puf_a...); }, #kernel)
 
 // cuBLAS (fp32 only)
 typedef struct PufCpuCublas* cublasHandle_t;
@@ -411,14 +592,33 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
         const void* alpha, const void* A, cudaDataType_t at, int lda,
         const void* B, cudaDataType_t bt, int ldb, const void* beta,
         void* C, cudaDataType_t ct, int ldc, cublasComputeType_t, cublasGemmAlgo_t) {
-    if (at != CUDA_R_32F || bt != CUDA_R_32F || ct != CUDA_R_32F) {
-        puf_cpu_fatal("cublasGemmEx with non-fp32 operands");
+    bool bf16 = at == CUDA_R_16BF && bt == CUDA_R_16BF && ct == CUDA_R_16BF;
+    if (!bf16 && (at != CUDA_R_32F || bt != CUDA_R_32F || ct != CUDA_R_32F)) {
+        puf_cpu_fatal("cublasGemmEx with mixed operand types");
     }
     if (m <= 0 || n <= 0) {
         return 0;
     }
     bool prof = puf_prof_enabled();
     double t0 = prof ? puf_cpu_now_s() : 0.0;
+#ifdef PUF_TRAIN_METAL
+    if (bf16) {
+        puf_metal_gemm_bf16(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
+            *(const float*)alpha, A, lda, B, ldb, *(const float*)beta, C, ldc);
+    } else {
+        puf_metal_sgemm(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
+            *(const float*)alpha, (const float*)A, lda, (const float*)B, ldb,
+            *(const float*)beta, (float*)C, ldc);
+    }
+    if (prof) {
+        char key[96];
+        snprintf(key, sizeof(key), "%s %c%c m=%d n=%d k=%d (encode)",
+            bf16 ? "gemm bf16" : "sgemm",
+            ta == CUBLAS_OP_T ? 'T' : 'N', tb == CUBLAS_OP_T ? 'T' : 'N', m, n, k);
+        puf_prof_add(key, puf_cpu_now_s() - t0);
+    }
+    return 0;
+#endif
     cblas_sgemm(PufCblasColMajor,
         ta == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
         tb == CUBLAS_OP_T ? PufCblasTrans : PufCblasNoTrans,
@@ -436,7 +636,8 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
 // cuRAND: Philox4x32-10 (Salmon et al. 2011), counter = (ctr, subsequence),
 // key = seed. Layout and semantics follow cuRAND's device API; outputs are not
 // guaranteed to be bit-identical to cuRAND.
-struct curandStatePhilox4_32_10_t {
+// alignas(16): same 64-byte layout as the MSL struct (uint4 is 16-aligned there)
+struct alignas(16) curandStatePhilox4_32_10_t {
     uint4 ctr;
     uint4 output;
     uint2 key;
@@ -542,6 +743,7 @@ static inline curandStatus_t curandSetPseudoRandomGeneratorSeed(
     return 0;
 }
 static inline curandStatus_t curandGenerateUniform(curandGenerator_t g, float* out, size_t n) {
+    PUF_METAL_FLUSH();
     curandStatePhilox4_32_10_t s;
     curand_init(g->seed, 0, 0, &s);
     for (size_t i = 0; i < n; i++) {
@@ -551,6 +753,7 @@ static inline curandStatus_t curandGenerateUniform(curandGenerator_t g, float* o
 }
 static inline curandStatus_t curandGenerateNormal(curandGenerator_t g, float* out,
         size_t n, float mean, float stddev) {
+    PUF_METAL_FLUSH();
     curandStatePhilox4_32_10_t s;
     curand_init(g->seed, 0, 0, &s);
     for (size_t i = 0; i + 1 < n + 1; i += 2) {

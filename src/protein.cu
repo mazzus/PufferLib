@@ -11,6 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Kernel launch macro from puf_backend.h (the trainer includes it first).
+// Standalone CUDA includers such as tests/test_protein_numerics.cu get the
+// plain CUDA form.
+#ifndef PUF_LAUNCH
+#define PUF_LAUNCH(kernel, ...) kernel<<<__VA_ARGS__>>>
+#endif
+
 #define PROTEIN_EPSILON 1e-6f
 #define PROTEIN_NUM_COST_RATIOS 6
 #define PROTEIN_ACQ_MAX_CAP 65536
