@@ -36,6 +36,7 @@ static id<MTLLibrary> g_gemm_lib = nil;  // src/puf_gemm.metal (MPP); nil = MPS 
 static std::mutex g_mu;
 static std::vector<Chunk> g_chunks;           // guarded by g_mu
 static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResources
+static std::atomic<size_t> g_res_n{0};       // g_res.size(), readable without g_mu
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipes;
 static NSMutableDictionary* g_macros = nil;
 static std::atomic<long> g_flushes{0}, g_gemm_n{0}, g_dispatch_n{0}, g_blit_n{0};
@@ -53,6 +54,7 @@ struct ThreadCtx {
     char* staging = nullptr;          // host->device upload ring (arena)
     size_t staging_off = 0;
     id<MTLComputeCommandEncoder> compute = nil;
+    size_t compute_res_n = 0;         // g_res entries made resident in `compute`
     id<MTLBlitCommandEncoder> blit = nil;
     // MPS kernel objects are not safe to encode from several threads at once,
     // so each thread caches its own (rollout workers encode concurrently).
@@ -187,6 +189,9 @@ extern "C" int puf_metal_has_mpp_gemm(void) {
 extern "C" void puf_metal_define(const char* name, long value) {
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
+    // The kernel library is compiled once at init; a later define would be
+    // silently ignored (e.g. wrong PUF_NUM_ATNS or precision).
+    if (g_lib) puf_metal_fatal("puf_metal_define after the kernel library was compiled");
     if (!g_macros) g_macros = [NSMutableDictionary new];
     g_macros[[NSString stringWithUTF8String:name]] = @(value);
 }
@@ -233,6 +238,7 @@ extern "C" void* puf_metal_alloc(size_t bytes) {
     Chunk c = {buf, (char*)buf.contents, cap, n};
     g_chunks.push_back(c);
     g_res.push_back(buf);
+    g_res_n.store(g_res.size());
     memset(c.base, 0, n);
     return c.base;
 }
@@ -290,6 +296,13 @@ extern "C" void puf_metal_flush(void) {
     commit_nowait(c);
     CFTimeInterval w0 = CACurrentMediaTime();
     [c->last waitUntilCompleted];
+    // Check here, not only in the completion handler: that runs on another
+    // thread and may fire after the host has already read the results.
+    if (c->last.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "PUF_TRAIN_METAL: command buffer error: %s\n",
+            [[c->last.error description] UTF8String]);
+        abort();
+    }
     c->last = nil;
     {
         std::lock_guard<std::mutex> g(g_time_mu);
@@ -559,9 +572,17 @@ extern "C" void puf_metal_dispatch(const char* name, uint32_t gx, uint32_t gy,
     }
     if (!c->compute) {
         c->compute = [c->cb computeCommandEncoder];
+        c->compute_res_n = 0;
+    }
+    // Kernels reach arena memory by GPU address only, so every chunk must be
+    // made resident in the encoder, including chunks allocated (e.g. a new
+    // split-K workspace) after the encoder was opened.
+    if (g_res_n.load() > c->compute_res_n) {
         std::lock_guard<std::mutex> g(g_mu);
-        [c->compute useResources:g_res.data() count:g_res.size()
+        [c->compute useResources:g_res.data() + c->compute_res_n
+            count:g_res.size() - c->compute_res_n
             usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        c->compute_res_n = g_res.size();
     }
     [c->compute setComputePipelineState:p];
     [c->compute setBytes:args length:args_len atIndex:0];

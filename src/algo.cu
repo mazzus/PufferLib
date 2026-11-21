@@ -1667,7 +1667,9 @@ __global__ void cache_imp_and_v(
     new_lp_out[idx] = new_lp;
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
 PUF_METAL_PORT(cache_imp_and_v, "cache_imp_and_v", (Prec dec_out, const float* actions, const precision_t* old_logprobs, const precision_t* action_mask, Prec logstd, const int* act_sizes, precision_t* imp_out, precision_t* value_out, float* logps, float* new_lp_out), (dec_out, actions, old_logprobs, action_mask, logstd, act_sizes, imp_out, value_out, logps, new_lp_out))
+#endif
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
@@ -1818,7 +1820,9 @@ __global__ void ppo_loss_compute(
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
         tid, PPO_THREADS, LOSS_N);
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
 PUF_METAL_PORT(ppo_loss_compute, "ppo_loss_compute", (float* ppo_partials, PPOKernelArgs a, PPOGraphArgs g), (ppo_partials, a, g))
+#endif
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce(

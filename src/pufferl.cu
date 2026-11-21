@@ -719,7 +719,9 @@ __global__ void sample_logits(
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
 PUF_METAL_PORT(sample_logits, "sample_logits", (Prec dec_out, Prec logstd, int* act_sizes, float* actions, float* env_actions, precision_t* logprobs, precision_t* value_out, curandStatePhilox4_32_10_t* rng_states, precision_t* action_mask, int mask_stride), (dec_out, logstd, act_sizes, actions, env_actions, logprobs, value_out, rng_states, action_mask, mask_stride))
+#endif
 
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.

@@ -93,3 +93,26 @@ argument-buffer convention, so it had stopped working. It is removed:
 - **MinGRU scans (~8%):** the only non-GEMM kernels worth another look.
 - **breakout:** the learner is a small share there. Its end-to-end SPS is
   bound by the env and rollout.
+
+## Review fixes
+
+From a review of the whole stack before merging:
+
+- **Residency:** the Metal runtime makes arena chunks resident for every
+  compute encoder. Before, a chunk allocated while an encoder was open
+  (for example a grown split-K workspace) was not made resident for that
+  encoder.
+- **GPU errors:** `puf_metal_flush` checks the command buffer status itself,
+  so a GPU error aborts before the host reads the results.
+- **Late defines:** `puf_metal_define` after the kernel library is compiled
+  is fatal instead of silently ignored.
+- **NetHack:** the `sample_logits`, `cache_imp_and_v` and `ppo_loss_compute`
+  Metal ports are disabled for `PUFFER_NETHACK` builds, because the MSL
+  versions lack the NetHack head logic. Host emulation runs instead.
+- **Protein test:** `src/protein.cu` defines a plain-CUDA `PUF_LAUNCH`
+  fallback, so `tests/test_protein_numerics.cu` builds again on CUDA. Its
+  output is byte-identical to stock 5.0. Both fail the checked-in golden
+  file the same way (157 of 412 records), so that file is stale upstream.
+
+CUDA breakout is still bit-identical (853.029). Metal bf16 breakout is
+unchanged (845.035), and the kernel tests pass in fp32 and bf16.
