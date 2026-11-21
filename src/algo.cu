@@ -199,8 +199,8 @@ void puf_kaiming_init(Prec* dst,
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateUniform(gen, buf, n);
     curandDestroyGenerator(gen);
-    uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
-    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    PUF_LAUNCH(uniform_scale_kernel, grid_size(n), BLOCK_SIZE, 0, stream)(buf, bound, n);
+    PUF_LAUNCH(cast, grid_size(n), BLOCK_SIZE, 0, stream)(dst->data, buf, n);
     cudaFree(buf);
 }
 
@@ -242,6 +242,7 @@ __global__ void mingru_gate(precision_t* out, precision_t* next_state,
     float s = sigmoid(proj);
     out[idx] = from_float(s * h_out + (1.0f - s) * x);
 }
+PUF_METAL_PORT(mingru_gate, "mingru_gate", (precision_t* out, precision_t* next_state, const precision_t* combined, const precision_t* state_in, const precision_t* x_in, int H, int B), (out, next_state, combined, state_in, x_in, H, B))
 
 // Train scan buffers. Cache post-reset h inputs; recompute outputs in bwd.
 struct PrefixScan {
@@ -255,6 +256,24 @@ struct PrefixScan {
     Prec grad_combined, grad_state;
     Prec grad_input;
 };
+#ifdef PUF_TRAIN_METAL
+static inline void puf_put(PufArgWriter& w, const PrefixScan& sc) {
+    w.align(8);
+    puf_put(w, sc.combined_ptr);
+    puf_put(w, sc.state_ptr);
+    puf_put(w, sc.input_ptr);
+    puf_put(w, sc.terminals_ptr);
+    puf_put(w, sc.B);
+    puf_put(w, sc.T);
+    puf_put(w, sc.H);
+    puf_put(w, sc.scan_h);
+    puf_put(w, sc.out);
+    puf_put(w, sc.next_state);
+    puf_put(w, sc.grad_combined);
+    puf_put(w, sc.grad_state);
+    puf_put(w, sc.grad_input);
+}
+#endif
 
 // Train scan: match rollout's precision_t recurrent state between steps.
 __global__ void mingru_scan_forward(PrefixScan scan) {
@@ -320,6 +339,7 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
 
     next_state[bH + h] = from_float(h_t);
 }
+PUF_METAL_PORT(mingru_scan_forward, "mingru_scan_forward", (PrefixScan scan), (scan))
 
 // Linear reverse scan. Cache is bf16 h only; a,z,h_tilde recomputed from gates in f32.
 __global__ void mingru_scan_backward(PrefixScan scan,
@@ -413,6 +433,7 @@ __global__ void mingru_scan_backward(PrefixScan scan,
 
     grad_state[state_idx] = from_float(dh);
 }
+PUF_METAL_PORT(mingru_scan_backward, "mingru_scan_backward", (PrefixScan scan, const precision_t* grad_out, const precision_t* grad_next_state), (scan, grad_out, grad_next_state))
 
 // Coalesced T-tile load + sequential apply. 32 h-threads apply after the load.
 // Use when T is long and seq occupancy B*H is not already huge.
@@ -560,6 +581,7 @@ __global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst,
     }
     dst[col] = from_float(sum);
 }
+PUF_METAL_PORT(sum_rows_to_precision_kernel, "sum_rows_to_precision_kernel", (precision_t* dst, const float* src, int R, int C), (dst, src, R, C))
 
 __global__ void assemble_decoder_grad(
         precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
@@ -571,6 +593,7 @@ __global__ void assemble_decoder_grad(
     int row = idx / od_plus_1, col = idx % od_plus_1;
     dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
 }
+PUF_METAL_PORT(assemble_decoder_grad, "assemble_decoder_grad", (precision_t* dst, const float* grad_logits, const float* grad_value, int B_TT, int od, int od_plus_1), (dst, grad_logits, grad_value, B_TT, od, od_plus_1))
 
 Prec encoder_forward(void* w, void* activations, Prec input, cudaStream_t stream) {
     EncoderWeights* ew = (EncoderWeights*)w;
@@ -706,12 +729,12 @@ Prec decoder_backward(void* w, void* activations, Float grad_logits,
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
     int od = dw->output_dim, od1 = od + 1;
-    assemble_decoder_grad<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(assemble_decoder_grad, grid_size(B_TT * od1), BLOCK_SIZE, 0, stream)(
         a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, od1);
     // dW // dX: weight grad on side stream, dX on main (needed for residual chain).
     puf_mm_tn_async_after(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.data != NULL) {
-        sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(sum_rows_to_precision_kernel, grid_size(dw->output_dim), BLOCK_SIZE, 0, stream)(
             a->logstd_scratch.data, grad_logstd.data, B_TT, dw->output_dim);
     }
     puf_mm_nn(&a->grad_out, &dw->weight, &a->grad_input, stream);
@@ -828,6 +851,123 @@ void* mingru_create_weights(void* self) {
     return mw;
 }
 
+// Host-native MinGRU kernels for the CPU backend (PUF_HOST_KERNELS). Same
+// per-element math as mingru_gate / mingru_scan_forward / mingru_scan_backward,
+// restructured so the hidden dim is the contiguous inner loop (vectorizable)
+// and batch rows run in parallel. Compiled but unused under CUDA.
+// Inner hidden-dim loops touch distinct buffers: tell clang it may vectorize.
+#if defined(__clang__) && !defined(__CUDACC__)
+#define PUF_HOST_SIMD _Pragma("clang loop vectorize(assume_safety)")
+#else
+#define PUF_HOST_SIMD
+#endif
+static inline float host_sigmoid(float x) {
+    float z = expf(-fabsf(x));
+    return x >= 0.0f ? 1.0f / (1.0f + z) : z / (1.0f + z);
+}
+
+static inline float host_lerp(float a, float b, float w) {
+    float diff = b - a;
+    return (fabsf(w) < 0.5f) ? a + w * diff : b - diff * (1.0f - w);
+}
+
+static void mingru_gate_host(precision_t* out, precision_t* next_state,
+        const precision_t* combined, const precision_t* state_in,
+        const precision_t* x_in, int H, int B) {
+    PUF_HOST_KERNEL_SCOPE("mingru_gate_host");
+    #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H >= 65536)
+    for (int b = 0; b < B; b++) {
+        const precision_t* c = combined + (long)b * 3 * H;
+        long r = (long)b * H;
+        PUF_HOST_SIMD
+        for (int h = 0; h < H; h++) {
+            float hidden = to_float(c[h]);
+            float z = host_sigmoid(to_float(c[H + h]));
+            float h_tilde = hidden >= 0.0f ? hidden + 0.5f : host_sigmoid(hidden);
+            float h_out = host_lerp(to_float(state_in[r + h]), h_tilde, z);
+            next_state[r + h] = from_float(h_out);
+            float s = host_sigmoid(to_float(c[2 * H + h]));
+            out[r + h] = from_float(s * h_out + (1.0f - s) * to_float(x_in[r + h]));
+        }
+    }
+}
+
+static void mingru_scan_forward_host(PrefixScan scan) {
+    PUF_HOST_KERNEL_SCOPE("mingru_scan_forward_host");
+    int T = scan.T, H = scan.H, B = scan.B;
+    #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H * T >= 65536)
+    for (int b = 0; b < B; b++) {
+        // next_state row is the running h (precision_t, as between CUDA steps)
+        precision_t* hs = scan.next_state.data + (long)b * H;
+        for (int h = 0; h < H; h++) {
+            hs[h] = scan.state_ptr[(long)b * H + h];
+        }
+        for (int t = 0; t < T; t++) {
+            bool term = scan.terminals_ptr != NULL
+                && to_float(scan.terminals_ptr[(long)b * T + t]) != 0.0f;
+            const precision_t* hid = scan.combined_ptr + ((long)b * T + t) * 3 * H;
+            const precision_t* x = scan.input_ptr + ((long)b * T + t) * H;
+            precision_t* sh = scan.scan_h.data + ((long)b * T + t) * H;
+            precision_t* o = scan.out.data + ((long)b * T + t) * H;
+            PUF_HOST_SIMD
+            for (int h = 0; h < H; h++) {
+                float h_t = term ? 0.0f : to_float(hs[h]);
+                sh[h] = from_float(h_t);
+                float hidden = to_float(hid[h]);
+                float z = host_sigmoid(to_float(hid[H + h]));
+                float h_tilde = hidden >= 0.0f ? hidden + 0.5f : host_sigmoid(hidden);
+                h_t = host_lerp(h_t, h_tilde, z);
+                float s = host_sigmoid(to_float(hid[2 * H + h]));
+                o[h] = from_float(s * h_t + (1.0f - s) * to_float(x[h]));
+                hs[h] = from_float(h_t);
+            }
+        }
+    }
+}
+
+static void mingru_scan_backward_host(PrefixScan scan,
+        const precision_t* grad_out, const precision_t* grad_next_state) {
+    PUF_HOST_KERNEL_SCOPE("mingru_scan_backward_host");
+    int T = scan.T, H = scan.H, B = scan.B;
+    #pragma omp parallel for schedule(static) if (!omp_in_parallel() && (long)B * H * T >= 65536)
+    for (int b = 0; b < B; b++) {
+        // grad_state row is the running dh
+        precision_t* dhs = scan.grad_state.data + (long)b * H;
+        for (int h = 0; h < H; h++) {
+            dhs[h] = grad_next_state[(long)b * H + h];
+        }
+        for (int t = T - 1; t >= 0; t--) {
+            long row = (long)b * T + t;
+            bool term = scan.terminals_ptr != NULL
+                && to_float(scan.terminals_ptr[row]) != 0.0f;
+            const precision_t* hid = scan.combined_ptr + row * 3 * H;
+            const precision_t* x = scan.input_ptr + row * H;
+            const precision_t* hp = scan.scan_h.data + row * H;
+            const precision_t* go = grad_out + row * H;
+            precision_t* gc = scan.grad_combined.data + row * 3 * H;
+            precision_t* gi = scan.grad_input.data + row * H;
+            PUF_HOST_SIMD
+            for (int h = 0; h < H; h++) {
+                float h_prev = to_float(hp[h]);
+                float hidden = to_float(hid[h]);
+                float z = host_sigmoid(to_float(hid[H + h]));
+                float h_tilde = hidden >= 0.0f ? hidden + 0.5f : host_sigmoid(hidden);
+                float h_t = host_lerp(h_prev, h_tilde, z);
+                float s = host_sigmoid(to_float(hid[2 * H + h]));
+                float gout = to_float(go[h]);
+                gi[h] = from_float(gout * (1.0f - s));
+                gc[2 * H + h] = from_float(gout * (h_t - to_float(x[h])) * s * (1.0f - s));
+                float dh_total = to_float(dhs[h]) + gout * s;
+                float d_h_tilde = dh_total * z;
+                gc[H + h] = from_float(dh_total * (h_tilde - h_prev) * z * (1.0f - z));
+                gc[h] = from_float(hidden >= 0.0f
+                    ? d_h_tilde : d_h_tilde * h_tilde * (1.0f - h_tilde));
+                dhs[h] = from_float(term ? 0.0f : dh_total * (1.0f - z));
+            }
+        }
+    }
+}
+
 Prec mingru_forward(void* w, Prec x, Prec state,
         void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
@@ -837,9 +977,14 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     for (int i = 0; i < m->num_layers; i++) {
         Prec state_i = mingru_state_layer(state, i, 0, B);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
-        mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
-            a->out.data, a->next_state.data,
-            a->combined[i].data, state_i.data, x.data, H, B);
+        if (PUF_HOST_MINGRU) {
+            mingru_gate_host(a->out.data, a->next_state.data,
+                a->combined[i].data, state_i.data, x.data, H, B);
+        } else {
+            PUF_LAUNCH(mingru_gate, grid_size(B*H), BLOCK_SIZE, 0, stream)(
+                a->out.data, a->next_state.data,
+                a->combined[i].data, state_i.data, x.data, H, B);
+        }
         puf_copy(&state_i, &a->next_state, stream);
         x = a->out;
     }
@@ -860,13 +1005,15 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.state_ptr = state_i.data;
         scan.input_ptr = a->saved_inputs[i].data;
         scan.terminals_ptr = terminals.data;
-        if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        if (PUF_HOST_MINGRU) {
+            mingru_scan_forward_host(scan);
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
-            mingru_scan_forward_row<<<grid, block, 0, stream>>>(scan);
+            PUF_LAUNCH(mingru_scan_forward_row, grid, block, 0, stream)(scan);
         } else {
-            mingru_scan_forward<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream>>>(scan);
+            PUF_LAUNCH(mingru_scan_forward, grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream)(scan);
         }
         x = scan.out;
     }
@@ -880,28 +1027,31 @@ __global__ void add_kernel(precision_t* __restrict__ dst,
         dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
     }
 }
+PUF_METAL_PORT(add_kernel, "add_kernel", (precision_t* dst, const precision_t* src, int n), (dst, src, n))
 
 Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
-        if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        if (PUF_HOST_MINGRU) {
+            mingru_scan_backward_host(scan, grad.data, a->grad_next_state.data);
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
-            mingru_scan_backward_row<<<grid, block, 0, stream>>>(
+            PUF_LAUNCH(mingru_scan_backward_row, grid, block, 0, stream)(
                 scan, grad.data, a->grad_next_state.data);
         } else {
-            mingru_scan_backward<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0,
-                stream>>>(scan, grad.data, a->grad_next_state.data);
+            PUF_LAUNCH(mingru_scan_backward, grid_size(scan.B * scan.H), BLOCK_SIZE, 0,
+                stream)(scan, grad.data, a->grad_next_state.data);
         }
         // dW on side stream (per-layer scratch); dX on main continues the bwd chain.
         puf_mm_tn_async_after(&scan.grad_combined, &a->saved_inputs[i],
             &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         int n = numel(scan.grad_input.shape);
-        add_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(add_kernel, grid_size(n), BLOCK_SIZE, 0, stream)(
             a->grad_input_buf.data, scan.grad_input.data, n);
         grad = a->grad_input_buf;
     }
@@ -973,7 +1123,7 @@ Activations arch_reg_rollout(Arch* p, Weights& w,
 }
 
 void weights_init(Arch* p, Weights& w,
-        uint64_t* seed, cudaStream_t stream) {
+        ulong* seed, cudaStream_t stream) {
     p->encoder.init_weights(w.encoder, seed, stream);
     p->decoder.init_weights(w.decoder, seed, stream);
     p->network.init_weights(w.network, seed, stream);
@@ -1057,6 +1207,7 @@ __global__ void muon_sum_sq_partials(float* __restrict__ partials,
     sdata[tid] = sum;
     block_reduce_sum(sdata, &partials[blockIdx.x], tid, blockDim.x, 1);
 }
+PUF_METAL_PORT(muon_sum_sq_partials, "muon_sum_sq_partials", (float* partials, const precision_t* src, int n), (partials, src, n))
 
 __global__ void muon_sum_sq_reduce(float* __restrict__ out,
         const float* __restrict__ partials, int num_blocks) {
@@ -1065,6 +1216,7 @@ __global__ void muon_sum_sq_reduce(float* __restrict__ out,
     sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
     block_reduce_sum(sdata, out, tid, blockDim.x, 1);
 }
+PUF_METAL_PORT(muon_sum_sq_reduce, "muon_sum_sq_reduce", (float* out, const float* partials, int num_blocks), (out, partials, num_blocks))
 
 // Global grad clip by L2, then Nesterov into f32 momentum buffer.
 __global__ void muon_clip_nesterov(float* __restrict__ mb,
@@ -1079,6 +1231,7 @@ __global__ void muon_clip_nesterov(float* __restrict__ mb,
         gc[idx] = from_float(g + mu * m);
     }
 }
+PUF_METAL_PORT(muon_clip_nesterov, "muon_clip_nesterov", (float* mb, precision_t* gc, const float* sum_sq_ptr, float max_norm, float eps, float mu, int n), (mb, gc, sum_sq_ptr, max_norm, eps, mu, n))
 
 // x *= 1 / max(sqrt(sum_sq), eps)  — NS input normalize
 __global__ void muon_l2_normalize(precision_t* __restrict__ dst,
@@ -1089,6 +1242,7 @@ __global__ void muon_l2_normalize(precision_t* __restrict__ dst,
         dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
     }
 }
+PUF_METAL_PORT(muon_l2_normalize, "muon_l2_normalize", (precision_t* dst, const float* sum_sq_ptr, float eps, int n), (dst, sum_sq_ptr, eps, n))
 
 // dst = scale * src  (write NS result + aspect scale into flat grad buffer)
 __global__ void muon_store_update(precision_t* __restrict__ dst,
@@ -1098,6 +1252,7 @@ __global__ void muon_store_update(precision_t* __restrict__ dst,
         dst[idx] = from_float(scale * to_float(src[idx]));
     }
 }
+PUF_METAL_PORT(muon_store_update, "muon_store_update", (precision_t* dst, const precision_t* src, float scale, int n), (dst, src, scale, n))
 
 // wb = wb * (1 - lr*wd) - lr * update  (update already scaled; one call for all params)
 __global__ void muon_weight_update(float* __restrict__ wb,
@@ -1110,6 +1265,7 @@ __global__ void muon_weight_update(float* __restrict__ wb,
         wb[idx] = wb[idx] * wd_scale - lr * to_float(update[idx]);
     }
 }
+PUF_METAL_PORT(muon_weight_update, "muon_weight_update", (float* wb, const precision_t* update, const float* lr_ptr, float wd, int n), (wb, update, lr_ptr, wd, n))
 
 constexpr double ns_coeffs[5][3] = {
     {4.0848, -6.8946, 2.9270},
@@ -1163,11 +1319,11 @@ void muon_step(Muon* m, Float weights, Prec grads,
         float max_grad_norm, cudaStream_t stream = 0) {
     int n_grad = (int)numel(grads.shape);
     int sum_blocks = min((int)grid_size(n_grad), 256);
-    muon_sum_sq_partials<<<sum_blocks, 256, 0, stream>>>(
+    PUF_LAUNCH(muon_sum_sq_partials, sum_blocks, 256, 0, stream)(
         m->norm_partials, grads.data, n_grad);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+    PUF_LAUNCH(muon_sum_sq_reduce, 1, 256, 0, stream)(
         m->grad_norm, m->norm_partials, sum_blocks);
-    muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(muon_clip_nesterov, grid_size(n_grad), BLOCK_SIZE, 0, stream)(
         m->mb.data, grads.data, m->grad_norm,
         max_grad_norm, 1e-6f, (float)m->momentum, n_grad);
 
@@ -1192,11 +1348,11 @@ void muon_step(Muon* m, Float weights, Prec grads,
         Prec gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
 
         int nblk = min((int)grid_size(ne), 256);
-        muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(
+        PUF_LAUNCH(muon_sum_sq_partials, nblk, 256, 0, stream)(
             m->norm_partials, x.data, (int)ne);
-        muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+        PUF_LAUNCH(muon_sum_sq_reduce, 1, 256, 0, stream)(
             m->ns_norm, m->norm_partials, nblk);
-        muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(muon_l2_normalize, grid_size(ne), BLOCK_SIZE, 0, stream)(
             x.data, m->ns_norm, 1e-7f, (int)ne);
 
         // 5 steps land in x_buf. 4 = you break it.
@@ -1221,10 +1377,10 @@ void muon_step(Muon* m, Float weights, Prec grads,
             }
         }
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(muon_store_update, grid_size(ne), BLOCK_SIZE, 0, stream)(
             gc_ptr, x_buf.data, scale, (int)ne);
     }
-    muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(muon_weight_update, grid_size(n_grad), BLOCK_SIZE, 0, stream)(
         weights.data, grads.data, m->lr, 0.0f, n_grad);
 }
 
@@ -1303,6 +1459,12 @@ constexpr int ppo_max_head_classes() {
     return m > 0 ? m : 1;
 }
 constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
+#ifdef PUF_TRAIN_METAL
+// Env compile-time constants for the Metal kernel library (compiled lazily).
+static int puf_metal_env_defs = (puf_metal_define("PUF_NUM_ATNS", NUM_ATNS),
+    puf_metal_define("PUF_MAX_HEAD_A", PPO_MAX_HEAD_A),
+    USE_BF16 ? puf_metal_define("PUF_BF16", 1) : (void)0, 0);
+#endif
 
 // Fused loss function. PPO clipped loss + value + entropy
 // buffers + args are quite complex. We do the entire
@@ -1331,6 +1493,38 @@ struct PPOKernelArgs {
     int T_seq, A_total, N;
     bool is_continuous;
 };
+#ifdef PUF_TRAIN_METAL
+static inline void puf_put(PufArgWriter& w, const PPOGraphArgs& g) {
+    w.align(8);
+    puf_put(w, g.imp);
+    puf_put(w, g.actions);
+    puf_put(w, g.old_logprobs);
+    puf_put(w, g.advantages);
+    puf_put(w, g.values);
+    puf_put(w, g.returns);
+}
+static inline void puf_put(PufArgWriter& w, const PPOKernelArgs& a) {
+    w.align(8);
+    puf_put(w, a.grad_logits);
+    puf_put(w, a.grad_logstd);
+    puf_put(w, a.grad_values_pred);
+    puf_put(w, a.logits);
+    puf_put(w, a.logstd);
+    puf_put(w, a.values_pred);
+    puf_put(w, a.act_sizes);
+    puf_put(w, a.action_mask);
+    puf_put(w, a.num_atns);
+    puf_put(w, a.clip_coef);
+    puf_put(w, a.vf_clip_coef);
+    puf_put(w, a.vf_coef);
+    puf_put(w, a.ent_coef);
+    puf_put(w, a.T_seq);
+    puf_put(w, a.A_total);
+    puf_put(w, a.N);
+    puf_put(w, a.is_continuous);
+    w.align(8);
+}
+#endif
 
 struct PPOBufs {
     Float grad_logits, grad_values, grad_logstd;
@@ -1473,6 +1667,9 @@ __global__ void cache_imp_and_v(
     new_lp_out[idx] = new_lp;
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
+PUF_METAL_PORT(cache_imp_and_v, "cache_imp_and_v", (Prec dec_out, const float* actions, const precision_t* old_logprobs, const precision_t* action_mask, Prec logstd, const int* act_sizes, precision_t* imp_out, precision_t* value_out, float* logps, float* new_lp_out), (dec_out, actions, old_logprobs, action_mask, logstd, act_sizes, imp_out, value_out, logps, new_lp_out))
+#endif
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
@@ -1487,7 +1684,7 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
-    cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
+    PUF_LAUNCH(cache_imp_and_v, grid_size(B * TT), BLOCK_SIZE, 0, stream)(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
         logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
     return dec;
@@ -1623,6 +1820,9 @@ __global__ void ppo_loss_compute(
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
         tid, PPO_THREADS, LOSS_N);
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
+PUF_METAL_PORT(ppo_loss_compute, "ppo_loss_compute", (float* ppo_partials, PPOKernelArgs a, PPOGraphArgs g), (ppo_partials, a, g))
+#endif
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce(
@@ -1639,6 +1839,7 @@ __global__ void ppo_loss_reduce(
         losses_acc[LOSS_N] += 1.0f;
     }
 }
+PUF_METAL_PORT(ppo_loss_reduce, "ppo_loss_reduce", (float* losses_acc, const float* partials, int num_blocks), (losses_acc, partials, num_blocks))
 
 void ppo_loss_fwd_bwd(
         Prec& dec_out,    // (N, T, fused_cols) - fused logits+value from decoder
@@ -1678,9 +1879,9 @@ void ppo_loss_fwd_bwd(
         .T_seq = T, .A_total = A_total, .N = N,
         .is_continuous = is_continuous,
     };
-    ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
+    PUF_LAUNCH(ppo_loss_compute, ppo_grid, PPO_THREADS, 0, stream)(
             bufs.ppo_partials.data, args, graph_args);
-    ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
+    PUF_LAUNCH(ppo_loss_reduce, 1, LOSS_N, 0, stream)(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }
 
@@ -1763,3 +1964,4 @@ __global__ void puff_advantage(const precision_t* values,
         adv_st(returns + base, ret);
     }
 }
+PUF_METAL_PORT(puff_advantage, "puff_advantage", (const precision_t* values, const precision_t* rewards, const precision_t* dones, const precision_t* importance, precision_t* advantages, precision_t* returns, float gamma, float lambda, float rho_clip, float c_clip, int num_steps, int horizon), (values, rewards, dones, importance, advantages, returns, gamma, lambda, rho_clip, c_clip, num_steps, horizon))
