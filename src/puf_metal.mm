@@ -5,7 +5,9 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -34,6 +36,7 @@ static id<MTLLibrary> g_gemm_lib = nil;  // src/puf_gemm.metal (MPP); nil = MPS 
 static std::mutex g_mu;
 static std::vector<Chunk> g_chunks;           // guarded by g_mu
 static std::vector<id<MTLResource>> g_res;   // all chunk buffers, for useResources
+static std::atomic<size_t> g_res_n{0};       // g_res.size(), readable without g_mu
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipes;
 static NSMutableDictionary* g_macros = nil;
 static std::atomic<long> g_flushes{0}, g_gemm_n{0}, g_dispatch_n{0}, g_blit_n{0};
@@ -51,6 +54,7 @@ struct ThreadCtx {
     char* staging = nullptr;          // host->device upload ring (arena)
     size_t staging_off = 0;
     id<MTLComputeCommandEncoder> compute = nil;
+    size_t compute_res_n = 0;         // g_res entries made resident in `compute`
     id<MTLBlitCommandEncoder> blit = nil;
     // MPS kernel objects are not safe to encode from several threads at once,
     // so each thread caches its own (rollout workers encode concurrently).
@@ -93,10 +97,16 @@ static ThreadCtx* ctx() {
 static int g_commit_every = 0;
 static long g_small_gemm = 0;  // M*N*K at or below which gemm_tile replaces MPS
 // MPP GEMM tuning (env PUF_GEMM_SPLIT_TARGET / _MIN_KC / _KLOOP_MIN)
-static long g_split_target = 320;  // threadgroups to aim for (~8 per core, 40 cores)
+static long g_split_target = 2048; // threadgroups to aim for (~50 per core, 40 cores)
 static int g_split_min_kc = 512;   // minimum K per split
 static int g_kloop_min = 1024;     // K per threadgroup at which the barrier K loop is used
 static void commit_nowait(ThreadCtx* c);
+// PUF_METAL_GPU_PROFILE=1: every dispatch/blit gets its own command buffer and
+// its GPU time is attributed to its label (kernel name, or GEMM name + shape).
+// Serializes the GPU, so absolute speed drops; shares are what to read.
+static int g_gpu_prof = 0;
+static thread_local const char* tl_label = nullptr;
+static void gpu_prof_commit(ThreadCtx* c, const char* label);
 static void count_command(ThreadCtx* c) {
     if (++c->pending >= g_commit_every) commit_nowait(c);
 }
@@ -179,6 +189,9 @@ extern "C" int puf_metal_has_mpp_gemm(void) {
 extern "C" void puf_metal_define(const char* name, long value) {
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
+    // The kernel library is compiled once at init; a later define would be
+    // silently ignored (e.g. wrong PUF_NUM_ATNS or precision).
+    if (g_lib) puf_metal_fatal("puf_metal_define after the kernel library was compiled");
     if (!g_macros) g_macros = [NSMutableDictionary new];
     g_macros[[NSString stringWithUTF8String:name]] = @(value);
 }
@@ -195,6 +208,7 @@ extern "C" void puf_metal_init(void) {
         if (const char* v = getenv("PUF_GEMM_SPLIT_TARGET")) g_split_target = atol(v);
         if (const char* v = getenv("PUF_GEMM_MIN_KC")) g_split_min_kc = atoi(v);
         if (const char* v = getenv("PUF_GEMM_KLOOP_MIN")) g_kloop_min = atoi(v);
+        if (const char* v = getenv("PUF_METAL_GPU_PROFILE")) g_gpu_prof = atoi(v);
         if (g_commit_every < 1) g_commit_every = 1;
         load_library();
         load_gemm_library();
@@ -224,6 +238,7 @@ extern "C" void* puf_metal_alloc(size_t bytes) {
     Chunk c = {buf, (char*)buf.contents, cap, n};
     g_chunks.push_back(c);
     g_res.push_back(buf);
+    g_res_n.store(g_res.size());
     memset(c.base, 0, n);
     return c.base;
 }
@@ -281,12 +296,53 @@ extern "C" void puf_metal_flush(void) {
     commit_nowait(c);
     CFTimeInterval w0 = CACurrentMediaTime();
     [c->last waitUntilCompleted];
+    // Check here, not only in the completion handler: that runs on another
+    // thread and may fire after the host has already read the results.
+    if (c->last.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "PUF_TRAIN_METAL: command buffer error: %s\n",
+            [[c->last.error description] UTF8String]);
+        abort();
+    }
     c->last = nil;
     {
         std::lock_guard<std::mutex> g(g_time_mu);
         g_wait_s += CACurrentMediaTime() - w0;
     }
     g_flushes++;
+}
+
+struct GpuProfEntry { double s = 0; long n = 0; };
+static std::map<std::string, GpuProfEntry>* g_gpu_prof_map = nullptr;
+static void gpu_prof_dump() {
+    std::lock_guard<std::mutex> g(g_time_mu);
+    if (!g_gpu_prof_map) return;
+    std::vector<std::pair<std::string, GpuProfEntry>> v(g_gpu_prof_map->begin(), g_gpu_prof_map->end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.s > b.second.s; });
+    double total = 0;
+    for (auto& e : v) total += e.second.s;
+    fprintf(stderr, "\nPUF_METAL_GPU_PROFILE (GPU time %.2fs, one command buffer per command)\n", total);
+    for (auto& e : v) {
+        if (e.second.s < total * 1e-3) break;
+        fprintf(stderr, "  %8.3fs %5.1f%% %8ld %9.1fus  %s\n", e.second.s, 100 * e.second.s / total,
+            e.second.n, 1e6 * e.second.s / e.second.n, e.first.c_str());
+    }
+}
+static void gpu_prof_commit(ThreadCtx* c, const char* label) {
+    std::string key = label;
+    {
+        std::lock_guard<std::mutex> g(g_time_mu);
+        if (!g_gpu_prof_map) {
+            g_gpu_prof_map = new std::map<std::string, GpuProfEntry>();
+            atexit(gpu_prof_dump);
+        }
+    }
+    [c->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        std::lock_guard<std::mutex> g(g_time_mu);
+        GpuProfEntry& e = (*g_gpu_prof_map)[key];
+        e.s += done.GPUEndTime - done.GPUStartTime;
+        e.n++;
+    }];
+    commit_nowait(c);
 }
 
 // Small host->device copy without a flush: stage the bytes in a per-thread
@@ -325,7 +381,8 @@ extern "C" void puf_metal_copy(void* dst, const void* src, size_t bytes) {
     [blit_encoder(c) copyFromBuffer:cs.buf sourceOffset:(const char*)src - cs.base
         toBuffer:cd.buf destinationOffset:(char*)dst - cd.base size:bytes];
     g_blit_n++;
-    count_command(c);
+    if (g_gpu_prof) gpu_prof_commit(c, "blit copy");
+    else count_command(c);
 }
 
 extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
@@ -336,7 +393,8 @@ extern "C" void puf_metal_fill(void* dst, int value, size_t bytes) {
     size_t off = (char*)dst - cd.base;
     [blit_encoder(c) fillBuffer:cd.buf range:NSMakeRange(off, bytes) value:(uint8_t)value];
     g_blit_n++;
-    count_command(c);
+    if (g_gpu_prof) gpu_prof_commit(c, "blit fill");
+    else count_command(c);
 }
 
 // MPP GEMM (src/puf_gemm.metal). Takes cuBLAS column-major arguments:
@@ -367,6 +425,11 @@ static bool mpp_gemm(int bf16, int ta, int tb, int m, int n, int k, float alpha,
     char name[64];
     snprintf(name, sizeof(name), "puf_gemm_%s_%s%s%s", lay, bf16 ? "bf16" : "f32",
         (splits > 1 && bf16) ? "_part" : "", k_chunk >= g_kloop_min ? "_k" : "");
+    char label[128];
+    if (g_gpu_prof) {
+        snprintf(label, sizeof(label), "%s M=%d N=%d K=%d splits=%d", name, M, N, K, splits);
+        tl_label = label;
+    }
     void* out = C;
     if (splits > 1) {
         ThreadCtx* c = ctx();
@@ -396,9 +459,11 @@ static bool mpp_gemm(int bf16, int ta, int tb, int m, int n, int k, float alpha,
         } r = {args.c, puf_metal_gpu_address(C), M, N, K, ldb, lda, ldc, alpha, beta,
             splits, k_chunk};
         long mn = (long)M * N;
+        if (g_gpu_prof) strncat(label, " reduce", sizeof(label) - strlen(label) - 1);
         puf_metal_dispatch(bf16 ? "puf_gemm_splitk_reduce_bf16" : "puf_gemm_splitk_reduce_f32",
             (uint32_t)((mn + 255) / 256), 1, 1, 256, 1, 1, &r, sizeof(r));
     }
+    tl_label = nullptr;
     g_gemm_n++;
     return true;
 }
@@ -460,7 +525,8 @@ extern "C" void puf_metal_sgemm(int ta, int tb, int m, int n, int k,
     }
     [mm encodeToCommandBuffer:c->cb leftMatrix:ml rightMatrix:mr resultMatrix:mc];
     g_gemm_n++;
-    count_command(c);
+    if (g_gpu_prof) gpu_prof_commit(c, "mps sgemm");
+    else count_command(c);
 }
 
 static id<MTLComputePipelineState> pipeline(const char* name) {
@@ -506,16 +572,25 @@ extern "C" void puf_metal_dispatch(const char* name, uint32_t gx, uint32_t gy,
     }
     if (!c->compute) {
         c->compute = [c->cb computeCommandEncoder];
+        c->compute_res_n = 0;
+    }
+    // Kernels reach arena memory by GPU address only, so every chunk must be
+    // made resident in the encoder, including chunks allocated (e.g. a new
+    // split-K workspace) after the encoder was opened.
+    if (g_res_n.load() > c->compute_res_n) {
         std::lock_guard<std::mutex> g(g_mu);
-        [c->compute useResources:g_res.data() count:g_res.size()
+        [c->compute useResources:g_res.data() + c->compute_res_n
+            count:g_res.size() - c->compute_res_n
             usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        c->compute_res_n = g_res.size();
     }
     [c->compute setComputePipelineState:p];
     [c->compute setBytes:args length:args_len atIndex:0];
     [c->compute dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
         threadsPerThreadgroup:MTLSizeMake(bx, by, bz)];
     g_dispatch_n++;
-    count_command(c);
+    if (g_gpu_prof) gpu_prof_commit(c, tl_label ? tl_label : name);
+    else count_command(c);
 }
 
 extern "C" void puf_metal_times(double* gpu_s, double* wait_s) {
