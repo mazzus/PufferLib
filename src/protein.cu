@@ -11,6 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Kernel launch macro from puf_backend.h (the trainer includes it first).
+// Standalone CUDA includers such as tests/test_protein_numerics.cu get the
+// plain CUDA form.
+#ifndef PUF_LAUNCH
+#define PUF_LAUNCH(kernel, ...) kernel<<<__VA_ARGS__>>>
+#endif
+
 #define PROTEIN_EPSILON 1e-6f
 #define PROTEIN_NUM_COST_RATIOS 6
 #define PROTEIN_ACQ_MAX_CAP 65536
@@ -214,7 +221,7 @@ static void matern32lin_build_K(GaussianProcess *gp, const float *d_X1,
     float sigma_f = softplus(gp->kernel->raw_params[SF_IDX(np)]);
     float offset = softplus(gp->kernel->raw_params[OFF_IDX(np)]);
     dim3 block(GP_BLOCK, GP_BLOCK), grid(gp_grid(m), gp_grid(n));
-    matern32lin_k_kernel<<<grid, block, 0, stream>>>(
+    PUF_LAUNCH(matern32lin_k_kernel, grid, block, 0, stream)(
         d_X1, d_X2, d_K, gp->d_inv_ells, n, m, d, sigma_f, diag_noise, offset);
 }
 
@@ -337,12 +344,12 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         cublasSdot(gp->cublas, n, gp->d_y, 1, gp->d_alpha, 1, &data_fit);
         cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_ones, 0, &sum_alpha);
         data_fit -= gp->mean * sum_alpha;
-        gp_k_extract_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE, 0, stream>>>(gp->d_L, gp->d_diag, n);
+        PUF_LAUNCH(gp_k_extract_diag, (n + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            BLOCK_SIZE, 0, stream)(gp->d_L, gp->d_diag, n);
         cudaMemcpyAsync(gp->h_diag, gp->d_diag, n * sizeof(float),
             cudaMemcpyDeviceToHost, stream);
         cudaMemsetAsync(gp->d_Kinv, 0, n * n * sizeof(float), stream);
-        gp_k_set_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        PUF_LAUNCH(gp_k_set_diag, (n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream)(
             gp->d_Kinv, n, 1.0f);
         cusolverDnSetStream(gp->cusolver, stream);
         cusolverDnSpotrs(gp->cusolver, CUBLAS_FILL_MODE_LOWER, n, n, gp->d_L, n,
@@ -363,7 +370,7 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         dim3 b(GP_BLOCK, GP_BLOCK), g(gp_grid(n), gp_grid(n));
         int nblocks = g.x * g.y;
         int nthreads = GP_BLOCK * GP_BLOCK;
-        matern32lin_mll_grad_fuse<<<g, b, nsum * nthreads * sizeof(float), stream>>>(
+        PUF_LAUNCH(matern32lin_mll_grad_fuse, g, b, nsum * nthreads * sizeof(float), stream)(
             gp->d_X, gp->d_alpha, gp->d_Kinv, gp->d_inv_ells, n, d, sigma_f,
             offset, gp->d_partials);
         cudaMemcpyAsync(gp->h_partials, gp->d_partials,
@@ -577,7 +584,7 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->d_pred_c = sw->d_pred_y + acq_cap;
     cudaMalloc(&sw->d_rng, acq_cap * sizeof(curandStatePhilox4_32_10_t));
     cudaMalloc(&sw->d_centers, max_centers * dim * sizeof(float));
-    protein_k_init_rng<<<(acq_cap + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+    PUF_LAUNCH(protein_k_init_rng, (acq_cap + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE)(
         sw->d_rng, acq_cap, sw->rng_seed);
 
     sw->clf_w = (float *)calloc(dim, sizeof(float));
@@ -1147,7 +1154,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
     cudaMemcpyAsync(sw->d_centers, sw->centers_buf, n_centers * dim * sizeof(float),
         cudaMemcpyHostToDevice, sw->stream);
-    protein_k_sample<<<(n_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, sw->stream>>>(
+    PUF_LAUNCH(protein_k_sample, (n_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, sw->stream)(
         sw->d_candidates, sw->d_centers, sw->d_scales, sw->d_rng, n_total,
         n_centers, dim, sw->global_search_scale,
         cost_dim, is_fixed_cost ? fixed_cost_norm : NAN);
