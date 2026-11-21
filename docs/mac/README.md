@@ -19,8 +19,11 @@ CUDA builds are unaffected.
   1.1x on breakout (see PHASE6.md). `--float` builds fp32. `--no-metal`
   and macOS < 26 are always fp32. Checkpoints use the same flat fp32 format as CUDA and load
   in either direction.
-- `PUF_CPU_PROFILE=1 ./puffer train ...` prints a per-kernel profile, flush
-  counts and GPU busy time.
+- `PUF_CPU_PROFILE=1 ./puffer train ...` prints a per-kernel profile of
+  host time, flush counts and GPU busy time.
+- `PUF_METAL_GPU_PROFILE=1 ./puffer train ...` prints GPU time per kernel
+  (GEMMs by shape). Each command gets its own command buffer, so training
+  runs slower; read the shares, not the absolute speed.
 
 ## Status (M4 Max, 40-core GPU)
 
@@ -57,7 +60,8 @@ shorter runs (PHASE1.md).
 
 Phase write-ups: PHASE0.md (baseline), PHASE1.md (CPU backend, parity),
 PHASE3.md (Metal backend), PHASE4.md (performance), PHASE5.md (coverage,
-correctness), PHASE6.md (MPP GEMMs, bf16).
+correctness), PHASE6.md (MPP GEMMs, bf16), PHASE7.md (GPU profile, GEMM
+tuning).
 
 ## Tests and tools
 
@@ -69,4 +73,5 @@ correctness), PHASE6.md (MPP GEMMs, bf16).
 | `tests/bench_train_sps.sh BIN STEPS N` | end-to-end SPS protocol |
 | `tests/bench_learner.sh ENV` (+ `METAL=1`, `BF16=1`) | learner-only epochs (low-noise A/B) |
 | `tests/bench_env_sps.sh ENV` | env-only ceiling |
+| `tests/bench_gemm_shapes.cpp` | time of the backend's GEMM path at given shapes (build line in the file) |
 | `tests/smoke_train_all.sh` | brief training of every built env |

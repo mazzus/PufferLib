@@ -147,7 +147,4 @@ No env hit the bf16 horizon constraint, and no losses went NaN.
 
 ## Not done
 
-- **MPP tile tuning:** for example tetris dW shapes, Morton order and
-  static extents.
-- `tests/test_metal_gemm.mm` still uses the older argument-buffer
-  convention.
+- MPP tuning and the GEMM tests: see PHASE7.md.
