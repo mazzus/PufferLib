@@ -22,8 +22,10 @@
 //   - NCCL, NVML, NVTX and the profiler API are stubs (single process only).
 #pragma once
 
-#ifndef PRECISION_FLOAT
-#error "PUF_TRAIN_CPU requires PRECISION_FLOAT (build with --float)"
+// bf16 (no PRECISION_FLOAT) needs the Metal backend: bf16 GEMMs run on the
+// GPU (src/puf_gemm.metal); host-run kernels convert via to_float/from_float.
+#if !defined(PRECISION_FLOAT) && !defined(PUF_TRAIN_METAL)
+#error "PUF_TRAIN_CPU without Metal requires PRECISION_FLOAT (build with --float)"
 #endif
 
 #include <math.h>
@@ -112,20 +114,32 @@ static inline auto min(A a, B b) { return a < b ? a : b; }
 template <class A, class B>
 static inline auto max(A a, B b) { return a < b ? b : a; }
 
-// bf16 storage type (only for the GPU-env obs widen overload; fp32 training)
-struct __nv_bfloat16 { uint16_t x; };
-static inline float __bfloat162float(__nv_bfloat16 b) {
-    uint32_t bits = (uint32_t)b.x << 16;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
-static inline __nv_bfloat16 __float2bfloat16(float f) {
+// bf16 storage type (round-to-nearest-even like cuda_bf16.h). Used for the
+// GPU-env obs widen overload in fp32 builds and as precision_t in bf16 builds.
+// Converts implicitly to and from float like the host side of cuda_bf16.h,
+// so env headers that write float expressions into obs_t compile unchanged.
+static inline uint16_t puf_f32_to_bf16_bits(float f) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (uint16_t)((bits >> 16) | 0x40u);  // NaN stays (quiet) NaN
+    }
     uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);
-    return {(uint16_t)((bits + rounding) >> 16)};
+    return (uint16_t)((bits + rounding) >> 16);
 }
+struct __nv_bfloat16 {
+    uint16_t x;
+    __nv_bfloat16() = default;
+    __nv_bfloat16(float f) : x(puf_f32_to_bf16_bits(f)) {}
+    operator float() const {
+        uint32_t bits = (uint32_t)x << 16;
+        float f;
+        memcpy(&f, &bits, 4);
+        return f;
+    }
+};
+static inline float __bfloat162float(__nv_bfloat16 b) { return (float)b; }
+static inline __nv_bfloat16 __float2bfloat16(float f) { return __nv_bfloat16(f); }
 
 // Deterministic block reduce, emulation version. Same tree order as the CUDA
 // version in pufferl.cu (which is skipped via this guard). Threads run
@@ -222,6 +236,9 @@ static inline cudaError_t cudaMemcpy(void* d, const void* s, size_t n, cudaMemcp
 #ifdef PUF_TRAIN_METAL
     if (puf_metal_owns(d) && puf_metal_owns(s)) {
         puf_metal_copy(d, s, n);
+        return cudaSuccess;
+    }
+    if (puf_metal_owns(d) && puf_metal_upload(d, s, n)) {
         return cudaSuccess;
     }
     puf_metal_flush();
@@ -328,6 +345,9 @@ static inline void puf_prof_dump() {
     long fl, gm, dp, bl;
     puf_metal_stats(&fl, &gm, &dp, &bl);
     fprintf(stderr, "metal: flushes=%ld gemms=%ld dispatches=%ld blits=%ld\n", fl, gm, dp, bl);
+    double gpu_s, wait_s;
+    puf_metal_times(&gpu_s, &wait_s);
+    fprintf(stderr, "metal: gpu busy %.2fs (summed over threads), host wait %.2fs\n", gpu_s, wait_s);
 #endif
     for (int i = 0; i < puf_prof_n && i < 40; i++) {
         PufProfEntry* e = &puf_prof_tab[i];
@@ -403,6 +423,11 @@ template <uint64_t H>
 static inline bool puf_metal_try(PufKernelId<H>, const PufLaunchCfg&, ...) {
     return false;
 }
+// Host-emulated kernels that only touch memory the GPU never uses can run
+// without flushing pending GPU work (PUF_HOST_NOFLUSH next to the kernel).
+template <uint64_t H> static inline bool puf_host_noflush(PufKernelId<H>) { return false; }
+#define PUF_HOST_NOFLUSH(kernel) \
+    static inline bool puf_host_noflush(PufKernelId<puf_hash(#kernel)>) { return true; }
 
 struct PufArgWriter {
     alignas(16) unsigned char buf[2048];
@@ -510,7 +535,9 @@ template <uint64_t H, class F> struct PufLaunch {
             return;
         }
 #endif
-        PUF_METAL_FLUSH();
+        if (!puf_host_noflush(PufKernelId<H>{})) {
+            PUF_METAL_FLUSH();
+        }
         if (prof) t0 = puf_cpu_now_s();
         launch(a...);
         if (prof) {
@@ -565,8 +592,9 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
         const void* alpha, const void* A, cudaDataType_t at, int lda,
         const void* B, cudaDataType_t bt, int ldb, const void* beta,
         void* C, cudaDataType_t ct, int ldc, cublasComputeType_t, cublasGemmAlgo_t) {
-    if (at != CUDA_R_32F || bt != CUDA_R_32F || ct != CUDA_R_32F) {
-        puf_cpu_fatal("cublasGemmEx with non-fp32 operands");
+    bool bf16 = at == CUDA_R_16BF && bt == CUDA_R_16BF && ct == CUDA_R_16BF;
+    if (!bf16 && (at != CUDA_R_32F || bt != CUDA_R_32F || ct != CUDA_R_32F)) {
+        puf_cpu_fatal("cublasGemmEx with mixed operand types");
     }
     if (m <= 0 || n <= 0) {
         return 0;
@@ -574,12 +602,18 @@ static inline cublasStatus_t cublasGemmEx(cublasHandle_t,
     bool prof = puf_prof_enabled();
     double t0 = prof ? puf_cpu_now_s() : 0.0;
 #ifdef PUF_TRAIN_METAL
-    puf_metal_sgemm(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
-        *(const float*)alpha, (const float*)A, lda, (const float*)B, ldb,
-        *(const float*)beta, (float*)C, ldc);
+    if (bf16) {
+        puf_metal_gemm_bf16(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
+            *(const float*)alpha, A, lda, B, ldb, *(const float*)beta, C, ldc);
+    } else {
+        puf_metal_sgemm(ta == CUBLAS_OP_T, tb == CUBLAS_OP_T, m, n, k,
+            *(const float*)alpha, (const float*)A, lda, (const float*)B, ldb,
+            *(const float*)beta, (float*)C, ldc);
+    }
     if (prof) {
         char key[96];
-        snprintf(key, sizeof(key), "mps sgemm %c%c m=%d n=%d k=%d (encode)",
+        snprintf(key, sizeof(key), "%s %c%c m=%d n=%d k=%d (encode)",
+            bf16 ? "gemm bf16" : "sgemm",
             ta == CUBLAS_OP_T ? 'T' : 'N', tb == CUBLAS_OP_T ? 'T' : 'N', m, n, k);
         puf_prof_add(key, puf_cpu_now_s() - t0);
     }

@@ -1,11 +1,13 @@
-// Metal ports of the trainer's CUDA kernels (fp32). Each kernel mirrors its
+// Metal ports of the trainer's CUDA kernels. Each kernel mirrors its
 // CUDA version in src/pufferl.cu / src/algo.cu line for line; the host-side
 // argument struct layout is produced by PUF_METAL_PORT (src/puf_cuda_cpu.h):
 // fields in declaration order with natural C alignment, pointers as device
-// addresses, tensor views as {device float* data; long shape[8];}.
+// addresses, tensor views as {device precision_t* data; long shape[8];}.
 //
 // Compiled at runtime by src/puf_metal.mm (safe math mode) with env macros
-// PUF_NUM_ATNS and PUF_MAX_HEAD_A.
+// PUF_NUM_ATNS and PUF_MAX_HEAD_A, and PUF_BF16 when the trainer stores
+// activations/gradients in bf16 (precision_t = bfloat; arithmetic in fp32 via
+// to_float/from_float exactly where the CUDA kernels convert).
 #include <metal_stdlib>
 using namespace metal;
 
@@ -16,11 +18,18 @@ using namespace metal;
 #define PUF_MAX_HEAD_A 64
 #endif
 
+#ifdef PUF_BF16
+typedef bfloat precision_t;
+#define to_float(x) static_cast<float>(x)
+#define from_float(x) static_cast<bfloat>(x)
+#else
 typedef float precision_t;
 #define to_float(x) (x)
 #define from_float(x) (x)
+#endif
+typedef device precision_t* PPtr;
 
-struct Prec { device float* data; long shape[8]; };
+struct Prec { device precision_t* data; long shape[8]; };
 struct FloatT { device float* data; long shape[8]; };
 
 #define KERNEL_IDX \
@@ -54,35 +63,45 @@ static inline void block_reduce_sum(threadgroup float* smem, device float* out,
 
 // ---- casts / copies -------------------------------------------------------
 
-struct CastPF { device float* dst; device float* src; int n; };
+struct CastPF { PPtr dst; device float* src; int n; };
 kernel void cast_p_f(constant CastPF& a [[buffer(0)]], KERNEL_IDX) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < a.n) a.dst[idx] = from_float(a.src[idx]);
+}
+struct CastFP { device float* dst; PPtr src; int n; };
+kernel void cast_f_p(constant CastFP& a [[buffer(0)]], KERNEL_IDX) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < a.n) a.dst[idx] = to_float(a.src[idx]);
+}
+struct CastPP { PPtr dst; PPtr src; int n; };
+kernel void cast_p_p(constant CastPP& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < a.n) a.dst[idx] = a.src[idx];
 }
-struct CastPU8 { device float* dst; device uchar* src; int n; };
+struct CastPU8 { PPtr dst; device uchar* src; int n; };
 kernel void cast_p_u8(constant CastPU8& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < a.n) a.dst[idx] = (float)a.src[idx];
+    if (idx < a.n) a.dst[idx] = from_float((float)a.src[idx]);
 }
-struct CastU8P { device uchar* dst; device float* src; int n; };
+struct CastU8P { device uchar* dst; PPtr src; int n; };
 kernel void cast_u8_p(constant CastU8P& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // CUDA: unsigned char = float (C conversion, truncation)
-    if (idx < a.n) a.dst[idx] = (uchar)a.src[idx];
+    if (idx < a.n) a.dst[idx] = (uchar)to_float(a.src[idx]);
 }
 struct CastRewTerm {
-    device float* rew_dst; device float* rew_src;
-    device float* term_dst; device float* term_src; int n;
+    PPtr rew_dst; device float* rew_src;
+    PPtr term_dst; device float* term_src; int n;
 };
 kernel void cast_rew_term(constant CastRewTerm& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < a.n) {
-        a.rew_dst[idx] = a.rew_src[idx];
-        a.term_dst[idx] = a.term_src[idx];
+        a.rew_dst[idx] = from_float(a.rew_src[idx]);
+        a.term_dst[idx] = from_float(a.term_src[idx]);
     }
 }
 
-struct Transpose { device float* dst; device float* src; int A, B, C; };
+struct Transpose { PPtr dst; PPtr src; int A, B, C; };
 kernel void transpose_102_p(constant Transpose& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = a.A * a.B * a.C;
@@ -94,19 +113,31 @@ kernel void transpose_102_p(constant Transpose& a [[buffer(0)]], KERNEL_IDX) {
     a.dst[b * a.A * a.C + ai * a.C + c] = a.src[idx];
 }
 
-struct Clamp { device float* dst; float lo, hi; int n; };
+struct TransposeF { device float* dst; device float* src; int A, B, C; };
+kernel void transpose_102_f(constant TransposeF& a [[buffer(0)]], KERNEL_IDX) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = a.A * a.B * a.C;
+    if (idx >= total) return;
+    int ai = idx / (a.B * a.C);
+    int rem = idx % (a.B * a.C);
+    int b = rem / a.C;
+    int c = rem % a.C;
+    a.dst[b * a.A * a.C + ai * a.C + c] = a.src[idx];
+}
+
+struct Clamp { PPtr dst; float lo, hi; int n; };
 kernel void clamp_precision_kernel(constant Clamp& a [[buffer(0)]], KERNEL_IDX) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < a.n;
             idx += blockDim.x * gridDim.x) {
-        a.dst[idx] = fmin(fmax(a.dst[idx], a.lo), a.hi);
+        a.dst[idx] = from_float(fmin(fmax(to_float(a.dst[idx]), a.lo), a.hi));
     }
 }
 
-struct AddArgs { device float* dst; device float* src; int n; };
+struct AddArgs { PPtr dst; PPtr src; int n; };
 kernel void add_kernel(constant AddArgs& a [[buffer(0)]], KERNEL_IDX) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < a.n;
             idx += blockDim.x * gridDim.x) {
-        a.dst[idx] = a.dst[idx] + a.src[idx];
+        a.dst[idx] = from_float(to_float(a.dst[idx]) + to_float(a.src[idx]));
     }
 }
 
@@ -143,7 +174,7 @@ kernel void zero_term_state(constant ZeroTerm& a [[buffer(0)]], KERNEL_IDX) {
     int layer = idx / (a.count * H);
     if (a.terminals.data[a.terminal_start + rel] == 0.0f) return;
     long i = state_elem_idx(layer, (int)a.state.shape[1], a.state_start + rel, h, H);
-    a.state.data[i] = 0.0f;
+    a.state.data[i] = from_float(0.0f);
 }
 
 // ---- MinGRU -----------------------------------------------------------------
@@ -158,8 +189,8 @@ static inline float lerp_f(float a, float b, float w) {
 }
 
 struct Gate {
-    device float* out; device float* next_state; device float* combined;
-    device float* state_in; device float* x_in; int H, B;
+    PPtr out; PPtr next_state; PPtr combined;
+    PPtr state_in; PPtr x_in; int H, B;
 };
 kernel void mingru_gate(constant Gate& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -169,22 +200,22 @@ kernel void mingru_gate(constant Gate& a [[buffer(0)]], KERNEL_IDX) {
     int b = idx / H;
     int h = idx % H;
     int combined_base = b * 3 * H;
-    float hidden = a.combined[combined_base + h];
-    float gate = a.combined[combined_base + H + h];
-    float proj = a.combined[combined_base + 2 * H + h];
-    float state = a.state_in[idx];
-    float x = a.x_in[idx];
+    float hidden = to_float(a.combined[combined_base + h]);
+    float gate = to_float(a.combined[combined_base + H + h]);
+    float proj = to_float(a.combined[combined_base + 2 * H + h]);
+    float state = to_float(a.state_in[idx]);
+    float x = to_float(a.x_in[idx]);
     float z = sigmoid_f(gate);
     float h_tilde = (hidden >= 0.0f) ? hidden + 0.5f : sigmoid_f(hidden);
     float h_out = lerp_f(state, h_tilde, z);
-    a.next_state[idx] = h_out;
+    a.next_state[idx] = from_float(h_out);
     float s = sigmoid_f(proj);
-    a.out[idx] = s * h_out + (1.0f - s) * x;
+    a.out[idx] = from_float(s * h_out + (1.0f - s) * x);
 }
 
 struct PrefixScan {
-    device float* combined_ptr; device float* state_ptr;
-    device float* input_ptr; device float* terminals_ptr;
+    PPtr combined_ptr; PPtr state_ptr;
+    PPtr input_ptr; PPtr terminals_ptr;
     int B, T, H;
     Prec scan_h, out, next_state, grad_combined, grad_state, grad_input;
 };
@@ -202,34 +233,35 @@ kernel void mingru_scan_forward(constant ScanFwd& args [[buffer(0)]], KERNEL_IDX
     int bHT = bH * T_seq;
     int out_base = bHT + h;
     int cbase = 3 * bHT;
-    float h_t = scan.state_ptr[bH + h];
+    float h_t = to_float(scan.state_ptr[bH + h]);
     int h_base = b * T_seq * H + h;
-    device float* ch = scan.combined_ptr + cbase + h;
-    device float* cg = scan.combined_ptr + cbase + H + h;
-    device float* cp = scan.combined_ptr + cbase + 2 * H + h;
+    PPtr ch = scan.combined_ptr + cbase + h;
+    PPtr cg = scan.combined_ptr + cbase + H + h;
+    PPtr cp = scan.combined_ptr + cbase + 2 * H + h;
     int out_curr = out_base;
     int t_offset = 0;
     for (int t = 0; t < T_seq; t++) {
-        if (scan.terminals_ptr != nullptr && scan.terminals_ptr[b * T_seq + t] != 0.0f) {
+        if (scan.terminals_ptr != nullptr && to_float(scan.terminals_ptr[b * T_seq + t]) != 0.0f) {
             h_t = 0.0f;
         }
-        scan.scan_h.data[h_base + t * H] = h_t;
-        float hidden_val = ch[t_offset];
-        float gate_val = cg[t_offset];
-        float proj_val = cp[t_offset];
-        float x_val = scan.input_ptr[out_base + t * H];
+        scan.scan_h.data[h_base + t * H] = from_float(h_t);
+        float hidden_val = to_float(ch[t_offset]);
+        float gate_val = to_float(cg[t_offset]);
+        float proj_val = to_float(cp[t_offset]);
+        float x_val = to_float(scan.input_ptr[out_base + t * H]);
         float z = sigmoid_f(gate_val);
         float h_tilde = (hidden_val >= 0.0f) ? hidden_val + 0.5f : sigmoid_f(hidden_val);
         h_t = lerp_f(h_t, h_tilde, z);
         float ps = sigmoid_f(proj_val);
-        scan.out.data[out_curr] = ps * h_t + (1.0f - ps) * x_val;
+        scan.out.data[out_curr] = from_float(ps * h_t + (1.0f - ps) * x_val);
+        h_t = to_float(from_float(h_t));
         out_curr += H;
         t_offset += H3;
     }
-    scan.next_state.data[bH + h] = h_t;
+    scan.next_state.data[bH + h] = from_float(h_t);
 }
 
-struct ScanBwd { PrefixScan scan; device float* grad_out; device float* grad_next_state; };
+struct ScanBwd { PrefixScan scan; PPtr grad_out; PPtr grad_next_state; };
 kernel void mingru_scan_backward(constant ScanBwd& args [[buffer(0)]], KERNEL_IDX) {
     constant PrefixScan& scan = args.scan;
     int T_seq = scan.T, H = scan.H, B = scan.B;
@@ -243,75 +275,75 @@ kernel void mingru_scan_backward(constant ScanBwd& args [[buffer(0)]], KERNEL_ID
     int state_idx = b * H + h;
     int out_base = bHT + h;
     int h_base = b * T_seq * H + h;
-    device float* ch = scan.combined_ptr + cbase + h;
-    device float* cg = scan.combined_ptr + cbase + H + h;
-    device float* cp = scan.combined_ptr + cbase + 2 * H + h;
-    device float* gch = scan.grad_combined.data + cbase + h;
-    device float* gcg = scan.grad_combined.data + cbase + H + h;
-    device float* gcp = scan.grad_combined.data + cbase + 2 * H + h;
-    float dh = args.grad_next_state[state_idx];
+    PPtr ch = scan.combined_ptr + cbase + h;
+    PPtr cg = scan.combined_ptr + cbase + H + h;
+    PPtr cp = scan.combined_ptr + cbase + 2 * H + h;
+    PPtr gch = scan.grad_combined.data + cbase + h;
+    PPtr gcg = scan.grad_combined.data + cbase + H + h;
+    PPtr gcp = scan.grad_combined.data + cbase + 2 * H + h;
+    float dh = to_float(args.grad_next_state[state_idx]);
     for (int t = T_seq; t >= 1; --t) {
         int t0 = t - 1;
         int t_offset = t0 * H3;
         int input_idx = out_base + t0 * H;
-        float h_prev = scan.scan_h.data[h_base + (t - 1) * H];
-        float hidden_val = ch[t_offset];
-        float gate_val = cg[t_offset];
-        float proj_val = cp[t_offset];
-        float x_val = scan.input_ptr[input_idx];
-        float grad_out_val = args.grad_out[input_idx];
+        float h_prev = to_float(scan.scan_h.data[h_base + (t - 1) * H]);
+        float hidden_val = to_float(ch[t_offset]);
+        float gate_val = to_float(cg[t_offset]);
+        float proj_val = to_float(cp[t_offset]);
+        float x_val = to_float(scan.input_ptr[input_idx]);
+        float grad_out_val = to_float(args.grad_out[input_idx]);
         float z = sigmoid_f(gate_val);
         float h_tilde = (hidden_val >= 0.0f) ? hidden_val + 0.5f : sigmoid_f(hidden_val);
         float h_t = lerp_f(h_prev, h_tilde, z);
         float ps = sigmoid_f(proj_val);
         float dh_from_out = grad_out_val * ps;
         float grad_proj = grad_out_val * (h_t - x_val) * ps * (1.0f - ps);
-        scan.grad_input.data[input_idx] = grad_out_val * (1.0f - ps);
-        gcp[t_offset] = grad_proj;
+        scan.grad_input.data[input_idx] = from_float(grad_out_val * (1.0f - ps));
+        gcp[t_offset] = from_float(grad_proj);
         float dh_total = dh + dh_from_out;
         float d_h_prev = dh_total * (1.0f - z);
         float d_h_tilde = dh_total * z;
         float d_z = dh_total * (h_tilde - h_prev);
         float d_gate = d_z * z * (1.0f - z);
         float d_hidden = (hidden_val >= 0.0f) ? d_h_tilde : d_h_tilde * h_tilde * (1.0f - h_tilde);
-        gch[t_offset] = d_hidden;
-        gcg[t_offset] = d_gate;
+        gch[t_offset] = from_float(d_hidden);
+        gcg[t_offset] = from_float(d_gate);
         dh = d_h_prev;
-        if (scan.terminals_ptr != nullptr && scan.terminals_ptr[b * T_seq + t0] != 0.0f) {
+        if (scan.terminals_ptr != nullptr && to_float(scan.terminals_ptr[b * T_seq + t0]) != 0.0f) {
             dh = 0.0f;
         }
     }
-    scan.grad_state.data[state_idx] = dh;
+    scan.grad_state.data[state_idx] = from_float(dh);
 }
 
 // ---- decoder ----------------------------------------------------------------
 
-struct SumRows { device float* dst; device float* src; int R, C; };
+struct SumRows { PPtr dst; device float* src; int R, C; };
 kernel void sum_rows_to_precision_kernel(constant SumRows& a [[buffer(0)]], KERNEL_IDX) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= a.C) return;
     float sum = 0.0f;
     for (int r = 0; r < a.R; r++) sum += a.src[r * a.C + col];
-    a.dst[col] = sum;
+    a.dst[col] = from_float(sum);
 }
 
-struct AsmGrad { device float* dst; device float* grad_logits; device float* grad_value; int B_TT, od, od_plus_1; };
+struct AsmGrad { PPtr dst; device float* grad_logits; device float* grad_value; int B_TT, od, od_plus_1; };
 kernel void assemble_decoder_grad(constant AsmGrad& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= a.B_TT * a.od_plus_1) return;
     int row = idx / a.od_plus_1, col = idx % a.od_plus_1;
-    a.dst[idx] = (col < a.od) ? a.grad_logits[row * a.od + col] : a.grad_value[row];
+    a.dst[idx] = from_float((col < a.od) ? a.grad_logits[row * a.od + col] : a.grad_value[row]);
 }
 
 // ---- Muon -------------------------------------------------------------------
 
-struct SumSqPartials { device float* partials; device float* src; int n; };
+struct SumSqPartials { device float* partials; PPtr src; int n; };
 kernel void muon_sum_sq_partials(constant SumSqPartials& a [[buffer(0)]], KERNEL_IDX) {
     threadgroup float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
     for (int i = blockIdx.x * blockDim.x + tid; i < a.n; i += blockDim.x * gridDim.x) {
-        float v = a.src[i];
+        float v = to_float(a.src[i]);
         sum += v * v;
     }
     sdata[tid] = sum;
@@ -327,39 +359,39 @@ kernel void muon_sum_sq_reduce(constant SumSqReduce& a [[buffer(0)]], KERNEL_IDX
 }
 
 struct ClipNesterov {
-    device float* mb; device float* gc; device float* sum_sq_ptr;
+    device float* mb; PPtr gc; device float* sum_sq_ptr;
     float max_norm, eps, mu; int n;
 };
 kernel void muon_clip_nesterov(constant ClipNesterov& a [[buffer(0)]], KERNEL_IDX) {
     float clip_coef = fmin(a.max_norm / (sqrt(*a.sum_sq_ptr) + a.eps), 1.0f);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < a.n) {
-        float g = a.gc[idx] * clip_coef;
+        float g = to_float(a.gc[idx]) * clip_coef;
         float m = a.mu * a.mb[idx] + g;
         a.mb[idx] = m;
-        a.gc[idx] = g + a.mu * m;
+        a.gc[idx] = from_float(g + a.mu * m);
     }
 }
 
-struct L2Norm { device float* dst; device float* sum_sq_ptr; float eps; int n; };
+struct L2Norm { PPtr dst; device float* sum_sq_ptr; float eps; int n; };
 kernel void muon_l2_normalize(constant L2Norm& a [[buffer(0)]], KERNEL_IDX) {
     float inv_norm = 1.0f / fmax(sqrt(*a.sum_sq_ptr), a.eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < a.n) a.dst[idx] = a.dst[idx] * inv_norm;
+    if (idx < a.n) a.dst[idx] = from_float(to_float(a.dst[idx]) * inv_norm);
 }
 
-struct StoreUpdate { device float* dst; device float* src; float scale; int n; };
+struct StoreUpdate { PPtr dst; PPtr src; float scale; int n; };
 kernel void muon_store_update(constant StoreUpdate& a [[buffer(0)]], KERNEL_IDX) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < a.n) a.dst[idx] = a.scale * a.src[idx];
+    if (idx < a.n) a.dst[idx] = from_float(a.scale * to_float(a.src[idx]));
 }
 
-struct WeightUpdate { device float* wb; device float* update; device float* lr_ptr; float wd; int n; };
+struct WeightUpdate { device float* wb; PPtr update; device float* lr_ptr; float wd; int n; };
 kernel void muon_weight_update(constant WeightUpdate& a [[buffer(0)]], KERNEL_IDX) {
     float lr = *a.lr_ptr;
     float wd_scale = 1.0f - lr * a.wd;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < a.n) a.wb[idx] = a.wb[idx] * wd_scale - lr * a.update[idx];
+    if (idx < a.n) a.wb[idx] = a.wb[idx] * wd_scale - lr * to_float(a.update[idx]);
 }
 
 // ---- policy heads (sampling, PPO) ---------------------------------------
@@ -369,21 +401,21 @@ static inline float finite_or_clamp(float x, float lo, float hi) {
     if (isinf(x)) return x > 0.0f ? hi : lo;
     return fmin(hi, fmax(lo, x));
 }
-static inline float safe_continuous_mean(device const float* logits, int idx) {
-    return finite_or_clamp(logits[idx], -1.0e6f, 1.0e6f);
+static inline float safe_continuous_mean(device const precision_t* logits, int idx) {
+    return finite_or_clamp(to_float(logits[idx]), -1.0e6f, 1.0e6f);
 }
-static inline float safe_continuous_logstd(device const float* logstd, int idx) {
-    return finite_or_clamp(logstd[idx], -20.0f, 2.0f);
+static inline float safe_continuous_logstd(device const precision_t* logstd, int idx) {
+    return finite_or_clamp(to_float(logstd[idx]), -20.0f, 2.0f);
 }
-static inline float load_logit_masked(device const float* logits, int logits_base,
-        int logits_offset, int a, device const float* mask, int mask_base) {
-    float l = logits[logits_base + logits_offset + a];
-    float m = mask[mask_base + logits_offset + a];
+static inline float load_logit_masked(device const precision_t* logits, int logits_base,
+        int logits_offset, int a, device const precision_t* mask, int mask_base) {
+    float l = to_float(logits[logits_base + logits_offset + a]);
+    float m = to_float(mask[mask_base + logits_offset + a]);
     if (m == 0.0f) l = -1e4f;
     return l;
 }
-static inline float ppo_discrete_logsumexp(device const float* logits, int logits_base,
-        int logits_offset, int A, device const float* mask, int mask_base,
+static inline float ppo_discrete_logsumexp(device const precision_t* logits, int logits_base,
+        int logits_offset, int A, device const precision_t* mask, int mask_base,
         thread float* cache) {
     float max_logit = -INFINITY;
     float sum = 0.0f;
@@ -464,14 +496,14 @@ static inline float philox_normal(thread PhiloxState& s) {
 
 struct SampleLogits {
     Prec dec_out; Prec logstd; device int* act_sizes; device float* actions;
-    device float* env_actions; device float* logprobs; device float* value_out;
-    device PhiloxState* rng_states; device float* action_mask; int mask_stride;
+    device float* env_actions; PPtr logprobs; PPtr value_out;
+    device PhiloxState* rng_states; PPtr action_mask; int mask_stride;
 };
 kernel void sample_logits(constant SampleLogits& a [[buffer(0)]], KERNEL_IDX) {
     int B = a.dec_out.shape[0];
     int fused_cols = a.dec_out.shape[1];
     int num_atns = PUF_NUM_ATNS;
-    device float* logits = a.dec_out.data;
+    PPtr logits = a.dec_out.data;
     bool is_continuous = a.logstd.data != nullptr && numel(a.logstd.shape) > 0;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B) return;
@@ -484,7 +516,8 @@ kernel void sample_logits(constant SampleLogits& a [[buffer(0)]], KERNEL_IDX) {
             float log_std = safe_continuous_logstd(a.logstd.data, h);
             float sd = exp(log_std);
             float action = finite_or_clamp(mean + sd * philox_normal(state), -1.0e6f, 1.0e6f);
-            float stored = action;
+            // Preserve reduced-precision continuous semantics for logprob.
+            float stored = to_float(from_float(action));
             float lp, ent;
             ppo_continuous_head(mean, log_std, stored, &lp, &ent);
             total_log_prob += lp;
@@ -512,7 +545,7 @@ kernel void sample_logits(constant SampleLogits& a [[buffer(0)]], KERNEL_IDX) {
             }
             if (sampled == A - 1) {
                 for (int k = A - 1; k >= 0; k--) {
-                    if (a.action_mask[mask_base + logits_offset + k] != 0.0f) {
+                    if (to_float(a.action_mask[mask_base + logits_offset + k]) != 0.0f) {
                         sampled = k;
                         break;
                     }
@@ -526,15 +559,15 @@ kernel void sample_logits(constant SampleLogits& a [[buffer(0)]], KERNEL_IDX) {
             logits_offset += A;
         }
     }
-    a.logprobs[idx] = total_log_prob;
+    a.logprobs[idx] = from_float(total_log_prob);
     a.value_out[idx] = logits[logits_base + fused_cols - 1];
     a.rng_states[idx] = state;
 }
 
 struct CacheImp {
-    Prec dec_out; device float* actions; device float* old_logprobs;
-    device float* action_mask; Prec logstd; device int* act_sizes;
-    device float* imp_out; device float* value_out; device float* logps;
+    Prec dec_out; device float* actions; PPtr old_logprobs;
+    PPtr action_mask; Prec logstd; device int* act_sizes;
+    PPtr imp_out; PPtr value_out; device float* logps;
     device float* new_lp_out;
 };
 kernel void cache_imp_and_v(constant CacheImp& a [[buffer(0)]], KERNEL_IDX) {
@@ -545,7 +578,7 @@ kernel void cache_imp_and_v(constant CacheImp& a [[buffer(0)]], KERNEL_IDX) {
     if (idx >= NT) return;
     int logits_base = idx * fused_cols;
     int at_base = idx * A_total;
-    device float* logits = a.dec_out.data;
+    PPtr logits = a.dec_out.data;
     a.value_out[idx] = logits[logits_base + A_total];
     float new_lp = 0.0f;
     if (a.logstd.data != nullptr) {
@@ -571,7 +604,7 @@ kernel void cache_imp_and_v(constant CacheImp& a [[buffer(0)]], KERNEL_IDX) {
         }
     }
     a.new_lp_out[idx] = new_lp;
-    a.imp_out[idx] = exp(new_lp - a.old_logprobs[idx]);
+    a.imp_out[idx] = from_float(exp(new_lp - to_float(a.old_logprobs[idx])));
 }
 
 #define LOSS_PG 0
@@ -587,16 +620,16 @@ kernel void cache_imp_and_v(constant CacheImp& a [[buffer(0)]], KERNEL_IDX) {
 
 struct PPOKernelArgs {
     device float* grad_logits; device float* grad_logstd; device float* grad_values_pred;
-    device float* logits; device float* logstd; device float* values_pred;
-    device int* act_sizes; device float* action_mask;
+    PPtr logits; PPtr logstd; PPtr values_pred;
+    device int* act_sizes; PPtr action_mask;
     int num_atns; float clip_coef, vf_clip_coef, vf_coef;
     device float* ent_coef;
     int T_seq, A_total, N;
     bool is_continuous;
 };
 struct PPOGraphArgs {
-    device float* imp; device float* actions; device float* old_logprobs;
-    device float* advantages; device float* values; device float* returns;
+    PPtr imp; device float* actions; PPtr old_logprobs;
+    PPtr advantages; PPtr values; PPtr returns;
 };
 struct PPOLossArgs { device float* ppo_partials; PPOKernelArgs a; PPOGraphArgs g; };
 
@@ -613,13 +646,13 @@ kernel void ppo_loss_compute(constant PPOLossArgs& args [[buffer(0)]], KERNEL_ID
         int nt = idx;
         int logits_base = nt * (a.A_total + 1);
         int at_base = nt * a.A_total;
-        float adv_for_pg = g.advantages[nt];
-        float val = g.values[nt];
-        float ret = g.returns[nt];
-        float val_pred = a.values_pred[logits_base];
+        float adv_for_pg = to_float(g.advantages[nt]);
+        float val = to_float(g.values[nt]);
+        float ret = to_float(g.returns[nt]);
+        float val_pred = to_float(a.values_pred[logits_base]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.grad_values_pred[nt] - g.old_logprobs[nt];
+        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
         float ratio = exp(logratio);
         float v_error = val_pred - val;
         float v_clipped = val + fmax(-a.vf_clip_coef, fmin(a.vf_clip_coef, v_error));
@@ -697,30 +730,31 @@ kernel void ppo_loss_reduce(constant LossReduce& a [[buffer(0)]], KERNEL_IDX) {
     if (tid == 0) a.losses_acc[LOSS_N] += 1.0f;
 }
 
-// GAE / V-trace (fp32: ADV_VEC_WIDTH = 4)
+// GAE / V-trace (W = ADV_VEC_WIDTH: 4 fp32, 8 bf16)
 struct Advantage {
-    device float* values; device float* rewards; device float* dones; device float* importance;
-    device float* advantages; device float* returns;
+    PPtr values; PPtr rewards; PPtr dones; PPtr importance;
+    PPtr advantages; PPtr returns;
     float gamma, lambda, rho_clip, c_clip; int num_steps, horizon;
 };
 kernel void puff_advantage(constant Advantage& a [[buffer(0)]], KERNEL_IDX) {
-    const int W = 4;
+    const int W = 16 / sizeof(precision_t);
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= a.num_steps) return;
     int horizon = a.horizon;
     int off = row * horizon;
     float lastlam = 0.f;
-    float next_v = a.values[off + horizon - 1];
-    float next_d = a.dones[off + horizon - 1];
-    float next_r = a.rewards[off + horizon - 1];
+    float next_v = to_float(a.values[off + horizon - 1]);
+    float next_d = to_float(a.dones[off + horizon - 1]);
+    float next_r = to_float(a.rewards[off + horizon - 1]);
     for (int seg = horizon / W - 1; seg >= 0; seg--) {
         int base = off + seg * W;
-        float v[W], r[W], d[W], imp[W], adv[W] = {0, 0, 0, 0}, ret[W];
+        float v[W], r[W], d[W], imp[W], adv[W], ret[W];
         for (int i = 0; i < W; i++) {
-            v[i] = a.values[base + i];
-            r[i] = a.rewards[base + i];
-            d[i] = a.dones[base + i];
-            imp[i] = a.importance != nullptr ? a.importance[base + i] : 1.f;
+            adv[i] = 0.f;
+            v[i] = to_float(a.values[base + i]);
+            r[i] = to_float(a.rewards[base + i]);
+            d[i] = to_float(a.dones[base + i]);
+            imp[i] = a.importance != nullptr ? to_float(a.importance[base + i]) : 1.f;
         }
         int i0 = (seg + 1 == horizon / W) ? W - 2 : W - 1;
         for (int i = i0; i >= 0; i--) {
@@ -734,8 +768,79 @@ kernel void puff_advantage(constant Advantage& a [[buffer(0)]], KERNEL_IDX) {
         }
         for (int i = 0; i < W; i++) {
             ret[i] = v[i] + adv[i];
-            a.advantages[base + i] = adv[i];
-            a.returns[base + i] = ret[i];
+            a.advantages[base + i] = from_float(adv[i]);
+            a.returns[base + i] = from_float(ret[i]);
+        }
+    }
+}
+
+// ---- small GEMM (replaces MPS where its ~75us host encode cost dominates) ---
+// Row-major C(M,N) = alpha * L' @ R' + beta * C with L' = transL ? L^T : L and
+// R' = transR ? R^T : R (puf_metal_sgemm maps cuBLAS column-major onto this).
+// 32x32 C tile per threadgroup, 4 simdgroups x (2x2 8x8 fragments), K step 16.
+#include <metal_simdgroup_matrix>
+struct GemmArgs {
+    device float* L; device float* R; device float* C;
+    int M, N, K, ldl, ldr, ldc, transL, transR;
+    float alpha, beta;
+};
+kernel void gemm_tile(constant GemmArgs& a [[buffer(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        uint sid [[simdgroup_index_in_threadgroup]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float As[32 * 16];
+    threadgroup float Bs[16 * 32];
+    threadgroup float Cs[32 * 32];
+    int row0 = tg.y * 32, col0 = tg.x * 32;
+    int sg_r = (sid / 2) * 16, sg_c = (sid % 2) * 16;
+    simdgroup_float8x8 acc[2][2];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_float8x8(0.0f);
+    for (int k0 = 0; k0 < a.K; k0 += 16) {
+        for (int e = tid; e < 512; e += 128) {
+            int r = e / 16, kk = e % 16;
+            int gi = row0 + r, gk = k0 + kk;
+            float v = 0.0f;
+            if (gi < a.M && gk < a.K) {
+                v = a.transL ? a.L[(long)gk * a.ldl + gi] : a.L[(long)gi * a.ldl + gk];
+            }
+            As[r * 16 + kk] = v;
+        }
+        for (int e = tid; e < 512; e += 128) {
+            int kk = e / 32, c = e % 32;
+            int gk = k0 + kk, gj = col0 + c;
+            float v = 0.0f;
+            if (gk < a.K && gj < a.N) {
+                v = a.transR ? a.R[(long)gj * a.ldr + gk] : a.R[(long)gk * a.ldr + gj];
+            }
+            Bs[kk * 32 + c] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 16; kk += 8) {
+            simdgroup_float8x8 af[2], bf[2];
+            for (int i = 0; i < 2; i++)
+                simdgroup_load(af[i], &As[(sg_r + i * 8) * 16 + kk], 16);
+            for (int j = 0; j < 2; j++)
+                simdgroup_load(bf[j], &Bs[kk * 32 + sg_c + j * 8], 32);
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            simdgroup_store(acc[i][j], &Cs[(sg_r + i * 8) * 32 + sg_c + j * 8], 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < 1024; e += 128) {
+        int r = e / 32, c = e % 32;
+        int gi = row0 + r, gj = col0 + c;
+        if (gi < a.M && gj < a.N) {
+            long ci = (long)gi * a.ldc + gj;
+            float v = a.alpha * Cs[e];
+            if (a.beta != 0.0f) v += a.beta * a.C[ci];
+            a.C[ci] = v;
         }
     }
 }

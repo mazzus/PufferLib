@@ -1007,8 +1007,8 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.terminals_ptr = terminals.data;
         if (PUF_HOST_MINGRU) {
             mingru_scan_forward_host(scan);
-        } else if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_forward_row, grid, block, 0, stream)(scan);
@@ -1036,8 +1036,8 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
         PrefixScan& scan = a->scan_bufs[i];
         if (PUF_HOST_MINGRU) {
             mingru_scan_backward_host(scan, grad.data, a->grad_next_state.data);
-        } else if (scan.T >= 256 && scan.B * scan.H <= 32768
-                || scan.T >= 128 && scan.H <= 32) {
+        } else if (!PUF_HOST_KERNELS && (scan.T >= 256 && scan.B * scan.H <= 32768
+                || scan.T >= 128 && scan.H <= 32)) {
             dim3 block(MINGRU_TILE, MINGRU_TILE);
             dim3 grid(scan.B, (scan.H + MINGRU_TILE - 1) / MINGRU_TILE);
             PUF_LAUNCH(mingru_scan_backward_row, grid, block, 0, stream)(
@@ -1462,7 +1462,8 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 #ifdef PUF_TRAIN_METAL
 // Env compile-time constants for the Metal kernel library (compiled lazily).
 static int puf_metal_env_defs = (puf_metal_define("PUF_NUM_ATNS", NUM_ATNS),
-    puf_metal_define("PUF_MAX_HEAD_A", PPO_MAX_HEAD_A), 0);
+    puf_metal_define("PUF_MAX_HEAD_A", PPO_MAX_HEAD_A),
+    USE_BF16 ? puf_metal_define("PUF_BF16", 1) : (void)0, 0);
 #endif
 
 // Fused loss function. PPO clipped loss + value + entropy
@@ -1666,7 +1667,9 @@ __global__ void cache_imp_and_v(
     new_lp_out[idx] = new_lp;
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
 PUF_METAL_PORT(cache_imp_and_v, "cache_imp_and_v", (Prec dec_out, const float* actions, const precision_t* old_logprobs, const precision_t* action_mask, Prec logstd, const int* act_sizes, precision_t* imp_out, precision_t* value_out, float* logps, float* new_lp_out), (dec_out, actions, old_logprobs, action_mask, logstd, act_sizes, imp_out, value_out, logps, new_lp_out))
+#endif
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
@@ -1817,7 +1820,9 @@ __global__ void ppo_loss_compute(
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
         tid, PPO_THREADS, LOSS_N);
 }
+#ifndef PUFFER_NETHACK  // the MSL port lacks the NetHack head logic; host version runs
 PUF_METAL_PORT(ppo_loss_compute, "ppo_loss_compute", (float* ppo_partials, PPOKernelArgs a, PPOGraphArgs g), (ppo_partials, a, g))
+#endif
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce(
